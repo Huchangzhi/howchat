@@ -40,6 +40,7 @@ jobs:
           pip install -e .
 
       - name: 用 PyInstaller 构建
+        shell: bash
         run: |
           pyinstaller --clean --noconfirm --onefile \
             --name howchat \
