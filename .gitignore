@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
+
+# 环境与编辑器
+.env
+.idea/
+.vscode/
+*.swp
+
+# howchat 本地数据
+.howchat/

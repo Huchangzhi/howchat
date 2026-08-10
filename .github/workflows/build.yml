@@ -1,0 +1,88 @@
+name: 编译 howchat
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号，例如 1.2.3。留空：仅上传编译产物到本次 Actions 运行；填写：同时创建 GitHub Release"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: 构建 · ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux
+            exe_ext: ""
+          - os: windows-latest
+            label: windows
+            exe_ext: ".exe"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -e .
+
+      - name: 用 PyInstaller 构建
+        run: |
+          pyinstaller --clean --noconfirm --onefile \
+            --name howchat \
+            --collect-all textual \
+            --collect-all cryptography \
+            howchat/__main__.py
+
+      - name: 重命名产物（带上平台标识）
+        shell: bash
+        run: |
+          mv dist/howchat${{ matrix.exe_ext }} dist/howchat-${{ matrix.label }}${{ matrix.exe_ext }}
+
+      - name: 上传编译产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: howchat-${{ matrix.label }}
+          path: dist/howchat-${{ matrix.label }}${{ matrix.exe_ext }}
+          if-no-files-found: error
+
+  release:
+    name: 发布 Release
+    needs: build
+    if: github.event.inputs.version != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 校验产物齐全
+        shell: bash
+        run: |
+          ls -l dist/
+          test -f dist/howchat-linux && echo "Linux 产物存在"
+          test -f dist/howchat-windows.exe && echo "Windows 产物存在"
+
+      - name: 创建 GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          gh release create "v${VERSION}" dist/howchat-linux dist/howchat-windows.exe \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "howchat v${VERSION}" \
+            --notes "howchat v${VERSION} 编译产物（Linux / Windows）。"
