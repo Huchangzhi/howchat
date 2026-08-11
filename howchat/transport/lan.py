@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import ipaddress
 import json
 import socket
 import struct
@@ -12,6 +13,9 @@ DISCOVERY_PORT = 41234
 TCP_PORT = 41235
 BEACON_INTERVAL = 5.0
 DISCOVERY_ADDR = "255.255.255.255"
+SCAN_INTERVAL = 60.0
+SCAN_TIMEOUT = 0.4
+SCAN_MAX_HOSTS = 2048
 
 
 class LANTransport(Transport):
@@ -24,6 +28,7 @@ class LANTransport(Transport):
         self.discovery_port = discovery_port
         self._connections = {}
         self._known = {}
+        self._scanned = set()
         self._server = None
         self._discovery = None
         self._tasks = []
@@ -45,6 +50,7 @@ class LANTransport(Transport):
                 [
                     loop.create_task(self._beacon_loop()),
                     loop.create_task(self._discovery_loop()),
+                    loop.create_task(self._tcp_scan_loop()),
                 ]
             )
         self._tasks = tasks
@@ -109,22 +115,41 @@ class LANTransport(Transport):
 
     def _broadcast_targets(self):
         targets = [DISCOVERY_ADDR]
-        sb = self._subnet_broadcast()
-        if sb:
-            targets.append(sb)
-        return targets
+        for ip, mask in self._interface_addrs():
+            try:
+                net = ipaddress.ip_network(f"{ip}/{mask}", strict=False)
+                targets.append(str(net.broadcast_address))
+            except ValueError:
+                continue
+        return list(dict.fromkeys(targets))
 
-    def _subnet_broadcast(self):
+    def _interface_addrs(self):
+        addrs = set()
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-        except OSError:
-            return None
-        if "." not in ip:
-            return None
-        return ".".join(ip.split(".")[:3]) + ".255"
+            import fcntl
+            import struct
+
+            for _idx, name in socket.if_nameindex():
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    ip = socket.inet_ntoa(
+                        fcntl.ioctl(s.fileno(), 0x8915, struct.pack("256s", name[:15].encode()))[20:24]
+                    )
+                    mask = socket.inet_ntoa(
+                        fcntl.ioctl(s.fileno(), 0x891B, struct.pack("256s", name[:15].encode()))[20:24]
+                    )
+                    addrs.add((ip, mask))
+                except (OSError, UnicodeEncodeError):
+                    continue
+                finally:
+                    s.close()
+        except (ImportError, OSError):
+            try:
+                for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
+                    addrs.add((ip, "255.255.255.0"))
+            except OSError:
+                pass
+        return addrs
 
     def _send_broadcast(self):
         beacon = self._beacon_bytes()
@@ -161,6 +186,56 @@ class LANTransport(Transport):
             self._known[peer_id] = (addr[0], peer_port)
             if peer_id not in self._connections and self.identity.peer_id < peer_id:
                 loop.create_task(self.connect_host(addr[0], peer_port))
+
+    def _scan_hosts(self):
+        hosts = set()
+        for ip, mask in self._interface_addrs():
+            try:
+                net = ipaddress.ip_network(f"{ip}/{mask}", strict=False)
+            except ValueError:
+                continue
+            if net.num_addresses > SCAN_MAX_HOSTS:
+                continue
+            for h in net.hosts():
+                hosts.add(str(h))
+        return hosts
+
+    def _own_addrs(self):
+        return {ip for ip, _mask in self._interface_addrs()}
+
+    async def _tcp_scan_loop(self):
+        while True:
+            await self._scan_once()
+            await asyncio.sleep(SCAN_INTERVAL)
+
+    async def _scan_once(self):
+        hosts = self._scan_hosts()
+        own = self._own_addrs()
+        targets = [h for h in hosts if h not in own and h not in self._scanned]
+        if not targets:
+            return
+        loop = asyncio.get_running_loop()
+        tasks = [loop.create_task(self._probe(ip)) for ip in targets]
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    async def _probe(self, ip):
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, TCP_PORT), timeout=SCAN_TIMEOUT
+            )
+        except (OSError, asyncio.TimeoutError):
+            self._scanned.add(ip)
+            return
+        self._scanned.add(ip)
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+        if ip not in {a[0] for a in self._known.values()}:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self.connect_host(ip, TCP_PORT))
 
     def _peer_info(self):
         return {

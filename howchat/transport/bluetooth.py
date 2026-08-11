@@ -300,15 +300,11 @@ def _bt_discover(uuid, channel, duration=4):
     result = []
     for mac in addresses:
         addr = mac.lower()
-        ports = []
         try:
             services = bluetooth.find_service(uuid=uuid, address=mac)
-            for svc in services:
-                p = svc.get("port")
-                if p:
-                    ports.append(p)
         except Exception:
-            ports = [channel]
+            continue
+        ports = [svc.get("port") for svc in services if svc.get("port")]
         for p in ports:
             result.append((addr, p, mac))
     return result
