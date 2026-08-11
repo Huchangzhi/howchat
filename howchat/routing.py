@@ -21,6 +21,7 @@ class Router:
         self.table = {}
         self._seen = set()
         self.on_deliver = None
+        self.on_route = None
         self._seq = 0
 
     def add_transport(self, transport):
@@ -74,7 +75,10 @@ class Router:
             self.discover(dst)
             return False
         envelope["route"] = []
-        return self._forward(envelope)
+        if not self._forward(envelope):
+            self.discover(dst)
+            return False
+        return True
 
     def _forward(self, envelope):
         if envelope["ttl"] <= 0:
@@ -175,6 +179,8 @@ class Router:
         current = self.table.get(target)
         if current is None or hops < current.hops:
             self.table[target] = RoutingEntry(via, hops, time.time())
+            if self.on_route:
+                self.on_route(target)
 
     def _replay_check(self, envelope):
         key = (envelope["src"], envelope["seq"])

@@ -18,6 +18,7 @@ SCAN_INTERVAL = 15.0
 SCAN_TIMEOUT = 0.4
 SCAN_MAX_HOSTS = 2048
 SCAN_PORT_RANGE = 6
+HANDSHAKE_TIMEOUT = 5.0
 
 
 class LANTransport(Transport):
@@ -266,8 +267,8 @@ class LANTransport(Transport):
         try:
             writer.write(protocol.encode_frame(protocol.pack_envelope(hello)))
             await writer.drain()
-            frame = await _read_frame(reader)
-        except (ConnectionError, OSError):
+            frame = await asyncio.wait_for(_read_frame(reader), timeout=HANDSHAKE_TIMEOUT)
+        except (ConnectionError, OSError, asyncio.TimeoutError):
             writer.close()
             return
         if frame is None:

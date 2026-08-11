@@ -46,6 +46,7 @@ async def test_app_sends_text_self():
     async with app.run_test() as pilot:
         await pilot.pause()
         core.store.update_contact_keys("peer999", "测试", "", "")
+        core.store.set_friend_status("peer999", "friend")
         app._refresh_contacts()
         await pilot.pause()
         app._switch_conv("peer999")

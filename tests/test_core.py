@@ -41,6 +41,11 @@ async def run_core_test():
             break
         await asyncio.sleep(0.05)
     assert idb.peer_id in ca.transport.neighbors(), "未建立连接"
+    for _ in range(100):
+        if ca.is_friend(idb.peer_id) and cb.is_friend(ida.peer_id):
+            break
+        await asyncio.sleep(0.05)
+    assert ca.is_friend(idb.peer_id), "直连后应自动成为好友"
 
     err = ca.send_text(idb.peer_id, "你好，这是加密消息")
     assert err is None, err
@@ -128,6 +133,11 @@ async def run_relay_test():
     err = ca.send_text(idb.peer_id, "通过中继的加密消息")
     assert err is None, err
     for _ in range(200):
+        if ca.is_friend(idb.peer_id) and cb.is_friend(ida.peer_id):
+            break
+        await asyncio.sleep(0.05)
+    assert ca.is_friend(idb.peer_id) and cb.is_friend(ida.peer_id), "发消息应自动完成好友流程"
+    for _ in range(200):
         if got_b:
             break
         await asyncio.sleep(0.05)
@@ -176,6 +186,11 @@ async def run_group_test():
         await asyncio.sleep(0.05)
     for n in nodes[1:]:
         assert hub[1].transport.neighbors(), "节点未连接到中心节点"
+    for _ in range(200):
+        if all(hub[1].is_friend(n[0].peer_id) for n in nodes[1:]):
+            break
+        await asyncio.sleep(0.05)
+    assert all(hub[1].is_friend(n[0].peer_id) for n in nodes[1:]), "直连后未自动成为好友"
 
     sender = nodes[0]
     others = [n[0].peer_id for n in nodes[1:]]
@@ -233,6 +248,7 @@ async def run_queued_sent_test():
         base64.b64encode(ida.x_pub_bytes()).decode(),
         base64.b64encode(ida.ed_pub_bytes()).decode(),
     )
+    store_a.set_friend_status(idb.peer_id, "friend")
 
     ra.online = False
     err = ca.send_text(idb.peer_id, "离线排队消息")
@@ -254,3 +270,67 @@ async def run_queued_sent_test():
 
 def test_core_queued_history_status():
     asyncio.run(run_queued_sent_test())
+
+
+async def run_friend_verify_test():
+    d1 = tempfile.mkdtemp()
+    d2 = tempfile.mkdtemp()
+    ida = identity_mod.load_or_create(os.path.join(d1, "data"))
+    idb = identity_mod.load_or_create(os.path.join(d2, "data"))
+
+    ra = Router(ida.peer_id)
+    ta = LANTransport(ida, ra, host="127.0.0.1", tcp_port=40801)
+    store_a = Store(os.path.join(d1, "store"))
+    ca = Core(ida, store_a, ra, ta)
+    status_a = []
+
+    ca.on_status = status_a.append
+    await ca.start(broadcast=False)
+
+    import base64
+
+    x_pub = base64.b64encode(ida.x_pub_bytes()).decode()
+    ed_pub = base64.b64encode(ida.ed_pub_bytes()).decode()
+    store_a.update_contact_keys(idb.peer_id, "乙", x_pub, ed_pub, ca._fingerprint(x_pub))
+
+    err = ca.request_friend(idb.peer_id)
+    assert err is None, err
+    assert store_a.get_contact(idb.peer_id).status == "pending"
+
+    err = ca.accept_friend(idb.peer_id)
+    assert err is None, err
+    assert ca.is_friend(idb.peer_id)
+
+    msg = ca.verify_friend(idb.peer_id)
+    assert "已确认" in msg, msg
+    assert store_a.get_contact(idb.peer_id).confirmed_fingerprint
+
+    ca._on_peer_change(
+        idb.peer_id,
+        True,
+        {
+            "nick": "乙",
+            "x_pub": base64.b64encode(ida.x_pub_bytes()).decode(),
+            "ed_pub": base64.b64encode(ida.ed_pub_bytes()).decode(),
+        },
+    )
+    assert not any("安全警告" in s for s in status_a), "相同密钥不应告警"
+
+    store_a.mark_verified(idb.peer_id, "AA BB CC DD")
+    status_a.clear()
+    ca._on_peer_change(
+        idb.peer_id,
+        True,
+        {
+            "nick": "乙",
+            "x_pub": base64.b64encode(ida.x_pub_bytes()).decode(),
+            "ed_pub": base64.b64encode(ida.ed_pub_bytes()).decode(),
+        },
+    )
+    assert any("安全警告" in s for s in status_a), "密钥变化应触发中间人警告"
+
+    await ca.stop()
+
+
+def test_core_friend_verify_and_keychange():
+    asyncio.run(run_friend_verify_test())

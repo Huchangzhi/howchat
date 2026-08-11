@@ -14,12 +14,14 @@ HELP_TEXT = """\
 可用命令：
   /connect <IP[:端口]>        直连指定节点（默认端口 41235）
   /peers                      查看在线用户
-  /msg <昵称或ID>             切换到私聊会话
-  /join <#频道> [成员ID...]    加入/创建群聊（不带成员时加入当前在线用户）
+  /msg <昵称或ID>             切换到私聊会话（◇ 陌生联系人直接发消息即可，自动成为好友）
+  /verify <ID或昵称>          确认对端公钥指纹（防中间人，建议双方都确认）
+  /reject <ID或昵称>          拒绝并屏蔽对方
+  /join <#频道> [成员ID...]    加入/创建群聊（不带成员时加入当前在线好友）
   /leave <#频道>              离开群聊
   /sendfile <目标> <路径>      发送文件（支持中继转发）
   /hop <目标> <跳板IP[:端口]>  通过跳板节点连接目标
-  /bt scan                    扫描附近蓝牙 howchat 设备
+  /bt scan                    扫描附近蓝牙 howchat 设备（约 4 秒）
   /bt connect <MAC[:频道]>     手动连接蓝牙设备（默认频道 4）
   /bt peers                   查看蓝牙邻居
   /nick <新昵称>              修改自己的昵称
@@ -27,7 +29,7 @@ HELP_TEXT = """\
   /whoami                     查看自己的 ID 与指纹
   /help                       显示本帮助
   /quit                       退出
-提示：普通输入视为向当前会话发送消息；群聊消息对每个成员端到端加密。"""
+提示：直连的设备自动成为好友；陌生联系人（◇）直接输入消息即可，会自动发送好友请求并排队，对方接受后自动送达。"""
 
 
 class IncomingMessage(Message):
@@ -156,9 +158,18 @@ class HowchatApp(App):
         contacts = self.core.store.contacts()
         items = []
         for peer_id in sorted(contacts):
+            c = contacts[peer_id]
+            if c.status == "blocked":
+                continue
             nick = self._contact_display(peer_id)
-            mark = "●" if peer_id in online else "○"
-            items.append((peer_id, f"{mark} {nick}"))
+            if c.status == "friend":
+                mark = "●" if peer_id in online else "○"
+                label = f"{mark} {nick}"
+                if c.confirmed_fingerprint:
+                    label += " ✓"
+            else:
+                label = f"◇ {nick}"
+            items.append((peer_id, label))
         channels = self.core.store.channels()
         for ch in sorted(channels):
             items.append((ch, f"#{ch.lstrip('#')}"))
@@ -185,8 +196,13 @@ class HowchatApp(App):
             self._write_system(f"当前频道 {conv_id} 成员：{'、'.join(self._contact_display(m) for m in members) or '无'}")
         else:
             fp = self.core.store.get_contact(conv_id)
-            if fp and fp.fingerprint:
-                self._write_system(f"对端指纹：{fp.fingerprint}")
+            if fp and fp.status == "stranger":
+                self._write_system("陌生联系人：直接输入消息即可，会自动发送好友请求，对方接受后送达")
+            elif fp and fp.fingerprint:
+                if fp.confirmed_fingerprint:
+                    self._write_system(f"对端指纹：{fp.fingerprint}（已确认 ✓）")
+                else:
+                    self._write_system(f"对端指纹：{fp.fingerprint}（未确认，请线下核对后用 /verify 确认）")
 
     def _render_entry(self, entry):
         ts = time.strftime("%H:%M", time.localtime(entry.get("ts", 0)))
@@ -249,6 +265,52 @@ class HowchatApp(App):
             else:
                 names = ", ".join(self._contact_display(p) for p in sorted(online))
                 self._status(f"在线用户：{names}")
+        elif cmd == "add":
+            if not args:
+                return self._status("用法：/add <ID或昵称>")
+            peer_id = self._resolve(args[0])
+            if not peer_id:
+                return self._status("找不到该联系人")
+            err = self.core.request_friend(peer_id)
+            if err:
+                return self._status(err)
+            self._status(f"已向 {self._contact_display(peer_id)} 发送好友请求，等待对方接受")
+            self._refresh_contacts()
+        elif cmd == "accept":
+            if not args:
+                return self._status("用法：/accept <ID或昵称>")
+            peer_id = self._resolve(args[0])
+            if not peer_id:
+                return self._status("找不到该联系人")
+            err = self.core.accept_friend(peer_id)
+            if err:
+                return self._status(err)
+            self._refresh_contacts()
+            if self.current == peer_id:
+                self._switch_conv(peer_id)
+        elif cmd == "reject":
+            if not args:
+                return self._status("用法：/reject <ID或昵称>")
+            peer_id = self._resolve(args[0])
+            if not peer_id:
+                return self._status("找不到该联系人")
+            err = self.core.decline_friend(peer_id)
+            if err:
+                return self._status(err)
+            self._status(f"已拒绝并屏蔽 {self._contact_display(peer_id)}")
+            self._refresh_contacts()
+        elif cmd == "verify":
+            if not args:
+                return self._status("用法：/verify <ID或昵称>")
+            peer_id = self._resolve(args[0])
+            if not peer_id:
+                return self._status("找不到该联系人")
+            msg = self.core.verify_friend(peer_id)
+            self._status(msg)
+            if not msg.startswith("只能"):
+                self._refresh_contacts()
+                if self.current == peer_id:
+                    self._switch_conv(peer_id)
         elif cmd == "bt":
             return await self._bt_command(args)
         elif cmd == "msg":
@@ -351,7 +413,7 @@ class HowchatApp(App):
             devices = await bt.scan()
             if not devices:
                 return self._status("未发现运行 howchat 的蓝牙设备")
-            lines = [f"{mac} (频道 {port})" for mac, port, _name in devices]
+            lines = [f"{name or mac}（{mac[:12]}, 频道 {port}）" for mac, port, name, _pid in devices]
             self._status("发现设备：" + " | ".join(lines))
             return None
         if sub == "connect":

@@ -6,6 +6,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+STATUS_STRANGER = "stranger"
+STATUS_PENDING = "pending"
+STATUS_FRIEND = "friend"
+STATUS_BLOCKED = "blocked"
+
+
 @dataclass
 class Contact:
     peer_id: str
@@ -14,6 +20,8 @@ class Contact:
     ed_pub_b64: str = ""
     fingerprint: str = ""
     last_seen: float = 0.0
+    status: str = STATUS_STRANGER
+    confirmed_fingerprint: str = ""
 
     def to_dict(self):
         return {
@@ -23,6 +31,8 @@ class Contact:
             "ed_pub_b64": self.ed_pub_b64,
             "fingerprint": self.fingerprint,
             "last_seen": self.last_seen,
+            "status": self.status,
+            "confirmed_fingerprint": self.confirmed_fingerprint,
         }
 
     @classmethod
@@ -34,6 +44,8 @@ class Contact:
             ed_pub_b64=d.get("ed_pub_b64", ""),
             fingerprint=d.get("fingerprint", ""),
             last_seen=d.get("last_seen", 0.0),
+            status=d.get("status", STATUS_STRANGER),
+            confirmed_fingerprint=d.get("confirmed_fingerprint", ""),
         )
 
 
@@ -81,7 +93,7 @@ class Store:
         path = self.contacts_dir / f"{contact.peer_id}.json"
         self._atomic_write(path, contact.to_dict())
 
-    def update_contact_keys(self, peer_id, nick, x_pub_b64, ed_pub_b64, fingerprint=""):
+    def update_contact_keys(self, peer_id, nick, x_pub_b64, ed_pub_b64, fingerprint="", status=None):
         c = self._contacts.get(peer_id) or Contact(peer_id, nick)
         if nick:
             c.nick = nick
@@ -91,7 +103,24 @@ class Store:
             c.ed_pub_b64 = ed_pub_b64
         if fingerprint:
             c.fingerprint = fingerprint
+        if status is not None:
+            c.status = status
         c.last_seen = time.time()
+        self.save_contact(c)
+
+    def set_friend_status(self, peer_id, status):
+        c = self._contacts.get(peer_id)
+        if c is None:
+            c = Contact(peer_id, peer_id[:8])
+            self._contacts[peer_id] = c
+        c.status = status
+        self.save_contact(c)
+
+    def mark_verified(self, peer_id, fingerprint):
+        c = self._contacts.get(peer_id)
+        if c is None:
+            return
+        c.confirmed_fingerprint = fingerprint
         self.save_contact(c)
 
     def channels(self):

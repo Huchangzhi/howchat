@@ -1,5 +1,7 @@
 import asyncio
 import base64
+import socket
+import struct
 import time
 
 from howchat import protocol
@@ -14,8 +16,11 @@ except ImportError:
     BT_NAME = None
 
 SERVICE_NAME = "howchat"
-SERVICE_UUID = "00001101-0000-1000-8000-00805f9b34fb"
+SERVICE_UUID = "8f3b6a1e-2f4a-4b7c-9d0e-1a2b3c4d5e6f"
+SPP_UUID = "00001101-0000-1000-8000-00805f9b34fb"
 SCAN_INTERVAL = 8.0
+IDLE_TIMEOUT = 30.0
+HANDSHAKE_TIMEOUT = 5.0
 
 
 class BluetoothTransport(Transport):
@@ -30,7 +35,6 @@ class BluetoothTransport(Transport):
         self._connections = {}
         self._cooldown = {}
         self._server_sock = None
-        self._sock = None
         self._stop = False
         self._tasks = []
         if self.available:
@@ -46,8 +50,9 @@ class BluetoothTransport(Transport):
         if not self.available:
             return
         try:
-            self._server_sock = _bt_listen(self.channel)
-            _bt_advertise(self._server_sock, SERVICE_NAME, self.uuid)
+            self._server_sock, ch = await asyncio.to_thread(_bt_listen, self.channel)
+            self.channel = ch
+            await asyncio.to_thread(_bt_advertise, self._server_sock, SERVICE_NAME, self.uuid)
         except Exception:
             self._server_sock = None
         loop = asyncio.get_running_loop()
@@ -57,11 +62,17 @@ class BluetoothTransport(Transport):
 
     async def stop(self):
         self._stop = True
+        for conn in list(self._connections.values()):
+            conn.queue.put_nowait(None)
+            try:
+                conn.sock.close()
+            except Exception:
+                pass
         for task in self._tasks:
             task.cancel()
         try:
             if self._server_sock is not None:
-                _bt_stop_advertise(self._server_sock)
+                await asyncio.to_thread(_bt_stop_advertise, self._server_sock)
                 self._server_sock.close()
         except Exception:
             pass
@@ -77,7 +88,7 @@ class BluetoothTransport(Transport):
         if not self.available:
             return False
         try:
-            sock = _bt_connect(addr, port)
+            sock = await asyncio.to_thread(_bt_connect, addr, port)
         except Exception:
             return False
         loop = asyncio.get_running_loop()
@@ -88,16 +99,28 @@ class BluetoothTransport(Transport):
         if not self.available:
             return []
         try:
-            return await asyncio.to_thread(_bt_discover, self.uuid, self.channel, duration)
+            found = await asyncio.to_thread(_bt_discover, self.uuid, duration)
         except Exception:
             return []
+        verified = []
+        for mac, port, name in found:
+            if self._stop:
+                break
+            pid = await asyncio.to_thread(_bt_probe_identity, self.identity, mac, port)
+            if not pid:
+                continue
+            verified.append((mac, port, name, pid))
+            if pid not in self._connections:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._autoconnect(mac, port))
+        return verified
 
     async def _accept_loop(self):
         if self._server_sock is None:
             return
         while not self._stop:
             try:
-                sock, addr = _bt_accept(self._server_sock)
+                sock, addr = await asyncio.to_thread(_bt_accept, self._server_sock)
             except Exception:
                 await asyncio.sleep(0.2)
                 continue
@@ -107,7 +130,7 @@ class BluetoothTransport(Transport):
     async def _scan_loop(self):
         while not self._stop:
             try:
-                found = await asyncio.to_thread(_bt_discover, self.uuid, self.channel)
+                found = await asyncio.to_thread(_bt_discover, self.uuid)
             except Exception:
                 found = ()
             now = time.time()
@@ -136,45 +159,30 @@ class BluetoothTransport(Transport):
         )
         try:
             await asyncio.to_thread(sock.sendall, protocol.encode_frame(protocol.pack_envelope(hello)))
-            frame = await asyncio.to_thread(_bt_read_frame, sock)
+            frame = await asyncio.to_thread(_bt_read_frame, sock, HANDSHAKE_TIMEOUT)
+        except (socket.timeout, ConnectionError, OSError):
+            self._close_sock(sock)
+            return
         except Exception:
-            try:
-                sock.close()
-            except Exception:
-                pass
+            self._close_sock(sock)
             return
         if frame is None:
-            try:
-                sock.close()
-            except Exception:
-                pass
+            self._close_sock(sock)
             return
         try:
             env = protocol.unpack_envelope(frame)
         except ValueError:
-            try:
-                sock.close()
-            except Exception:
-                pass
+            self._close_sock(sock)
             return
         if env.get("type") != protocol.TYPE_HELLO:
-            try:
-                sock.close()
-            except Exception:
-                pass
+            self._close_sock(sock)
             return
         peer_id = env["src"]
         if peer_id == self.identity.peer_id:
-            try:
-                sock.close()
-            except Exception:
-                pass
+            self._close_sock(sock)
             return
         if peer_id in self._connections:
-            try:
-                sock.close()
-            except Exception:
-                pass
+            self._close_sock(sock)
             return
         body = env.get("body", {})
         info = {
@@ -194,7 +202,10 @@ class BluetoothTransport(Transport):
     async def _read_loop(self, peer_id, sock):
         try:
             while not self._stop:
-                frame = await asyncio.to_thread(_bt_read_frame, sock)
+                try:
+                    frame = await asyncio.to_thread(_bt_read_frame, sock, IDLE_TIMEOUT)
+                except socket.timeout:
+                    continue
                 if frame is None:
                     break
                 try:
@@ -225,6 +236,10 @@ class BluetoothTransport(Transport):
             self.router.remove_neighbor(peer_id)
             if self.on_peer_change:
                 self.on_peer_change(peer_id, False, None)
+        self._close_sock(sock)
+
+    @staticmethod
+    def _close_sock(sock):
         try:
             sock.close()
         except Exception:
@@ -243,11 +258,19 @@ def _b64(data):
 
 
 def _bt_listen(channel):
-    sock = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
-    sock.settimeout(1.0)
-    sock.bind(("", channel))
-    sock.listen(1)
-    return sock
+    for ch in range(channel, channel + 8):
+        sock = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
+        sock.settimeout(1.0)
+        try:
+            sock.bind(("", ch))
+            sock.listen(1)
+            return sock, ch
+        except Exception:
+            try:
+                sock.close()
+            except Exception:
+                pass
+    raise RuntimeError(f"无法绑定蓝牙 RFCOMM 频道 {channel}~{channel + 7}")
 
 
 def _bt_advertise(sock, name, uuid):
@@ -263,6 +286,7 @@ def _bt_stop_advertise(sock):
 def _bt_accept(sock):
     sock.settimeout(1.0)
     client, addr = sock.accept()
+    client.settimeout(None)
     sock.settimeout(None)
     return client, addr
 
@@ -275,36 +299,83 @@ def _bt_connect(addr, port):
     return sock
 
 
-def _bt_read_frame(sock):
-    try:
-        sock.settimeout(5.0)
-        head = sock.recv(4)
-        if not head or len(head) < 4:
+def _recv_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
             return None
-        import struct
+        buf += chunk
+    return buf
 
-        (length,) = struct.unpack(">I", head)
-        body = b""
-        while len(body) < length:
-            chunk = sock.recv(length - len(body))
-            if not chunk:
-                return None
-            body += chunk
-        return body
+
+def _bt_read_frame(sock, timeout=IDLE_TIMEOUT):
+    sock.settimeout(timeout)
+    head = _recv_exact(sock, 4)
+    if head is None:
+        return None
+    (length,) = struct.unpack(">I", head)
+    body = _recv_exact(sock, length)
+    if body is None:
+        return None
+    return body
+
+
+def _bt_discover(uuid, duration=4):
+    found = bluetooth.discover_devices(duration=duration, lookup_names=True, flush_cache=True)
+    candidates = []
+    seen = set()
+    for mac, name in found:
+        addr = mac.lower()
+        ports = set()
+        for svc_uuid in (uuid, SPP_UUID):
+            try:
+                services = bluetooth.find_service(uuid=svc_uuid, address=mac)
+            except Exception:
+                continue
+            for svc in services:
+                port = svc.get("port")
+                if not port:
+                    continue
+                svc_name = (svc.get("name") or "").strip()
+                if svc_name and "howchat" not in svc_name.lower():
+                    continue
+                ports.add(port)
+        for port in ports:
+            if addr in seen:
+                continue
+            seen.add(addr)
+            candidates.append((addr, port, name or mac))
+    return candidates
+
+
+def _bt_probe_identity(identity, mac, port, timeout=HANDSHAKE_TIMEOUT):
+    try:
+        sock = _bt_connect(mac, port)
     except Exception:
         return None
-
-
-def _bt_discover(uuid, channel, duration=4):
-    addresses = bluetooth.discover_devices(duration=duration, lookup_names=False, flush_cache=True)
-    result = []
-    for mac in addresses:
-        addr = mac.lower()
+    try:
+        hello = protocol.make_clear_envelope(
+            protocol.TYPE_HELLO,
+            identity.peer_id,
+            "",
+            {"nick": identity.nick, "x_pub": _b64(identity.x_pub_bytes()), "ed_pub": _b64(identity.ed_pub_bytes())},
+        )
+        sock.sendall(protocol.encode_frame(protocol.pack_envelope(hello)))
+        frame = _bt_read_frame(sock, timeout)
+        if frame is None:
+            return None
+        env = protocol.unpack_envelope(frame)
+        if env.get("type") != protocol.TYPE_HELLO:
+            return None
+        pid = env.get("src")
+        if pid and pid != identity.peer_id:
+            return pid
+        return None
+    except Exception:
+        return None
+    finally:
         try:
-            services = bluetooth.find_service(uuid=uuid, address=mac)
+            sock.close()
         except Exception:
-            continue
-        ports = [svc.get("port") for svc in services if svc.get("port")]
-        for p in ports:
-            result.append((addr, p, mac))
-    return result
+            pass

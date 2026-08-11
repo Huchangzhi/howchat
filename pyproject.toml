@@ -1,6 +1,6 @@
 [project]
 name = "howchat"
-version = "0.1.0"
+version = "1.0.5"
 description = "离线去中心化端到端加密即时通讯工具（局域网 / 蓝牙，中继跳转）"
 readme = "README.md"
 requires-python = ">=3.10"

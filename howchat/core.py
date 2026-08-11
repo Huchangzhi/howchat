@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 
 from howchat import crypto, protocol
+from howchat.store import STATUS_BLOCKED, STATUS_FRIEND, STATUS_PENDING, STATUS_STRANGER, Contact
 
 FILE_CHUNK = 64 * 1024
 FLUSH_INTERVAL = 5.0
@@ -26,7 +27,9 @@ class Core:
         self.on_message_updated = None
         self._file_rcv = {}
         self._uid_conv = {}
+        self._pending_auto = {}
         self.router.on_deliver = self._on_delivered
+        self.router.on_route = lambda _target: self.flush_queued()
         for t in self.transports:
             t.on_peer_change = self._on_peer_change
         self._flush_task = None
@@ -45,14 +48,23 @@ class Core:
     async def connect_host(self, addr, port):
         return await self.transport.connect_host(addr, port)
 
-    def connect_bluetooth(self, mac, port=None):
+    async def connect_bluetooth(self, mac, port=None):
         for t in self.transports:
             if getattr(t, "kind", "") == "bluetooth" and t.available:
-                return t.connect_host(mac, port or getattr(t, "channel", 4))
-        return None
+                return await t.connect_host(mac, port or getattr(t, "channel", 4))
+        return False
 
     def discover(self, dst):
         self.router.discover(dst)
+
+    def is_friend(self, peer_id):
+        c = self.store.get_contact(peer_id)
+        return bool(c and c.status == STATUS_FRIEND)
+
+    def _friends(self):
+        return [
+            pid for pid, c in self.store.contacts().items() if c.status == STATUS_FRIEND
+        ]
 
     def _next_seq(self):
         return self.router.next_seq()
@@ -108,9 +120,123 @@ class Core:
         self._uid_conv[uid] = conv
         return "queued", uid
 
+    # ---------- 好友机制 ----------
+
+    def request_friend(self, peer_id):
+        c = self.store.get_contact(peer_id)
+        if not c:
+            return "找不到该联系人"
+        if c.status == STATUS_BLOCKED:
+            return "你已屏蔽该用户"
+        if c.status == STATUS_FRIEND:
+            return "你们已经是好友"
+        body = {"type": "friend_request", "nick": self.identity.nick}
+        env = self._encrypted_env(protocol.TYPE_FRIEND_REQUEST, peer_id, body)
+        if env is None:
+            return "尚无对方公钥，请先连接或经中继获取"
+        self.store.set_friend_status(peer_id, STATUS_PENDING)
+        self._dispatch(peer_id, env, conv=peer_id)
+        return None
+
+    def accept_friend(self, peer_id):
+        c = self.store.get_contact(peer_id)
+        if not c:
+            return "找不到该联系人"
+        if c.status == STATUS_BLOCKED:
+            return "你已屏蔽该用户"
+        if c.status == STATUS_FRIEND:
+            return "你们已经是好友"
+        env = self._encrypted_env(protocol.TYPE_FRIEND_ACCEPT, peer_id, {"type": "friend_accept"})
+        if env is None:
+            return "尚无对方公钥，无法确认好友关系"
+        self.store.set_friend_status(peer_id, STATUS_FRIEND)
+        self._dispatch(peer_id, env, conv=peer_id)
+        self._send_peer_list(peer_id)
+        for n in self._friends():
+            if n != peer_id:
+                self._send_peer_list(n, peers=[peer_id])
+        self._flush_pending_auto(peer_id)
+        self._status(f"已与 {c.nick} 成为好友")
+        return None
+
+    def decline_friend(self, peer_id):
+        c = self.store.get_contact(peer_id)
+        if not c:
+            return "找不到该联系人"
+        env = self._encrypted_env(protocol.TYPE_FRIEND_DECLINE, peer_id, {"type": "friend_decline"})
+        if env is not None:
+            self._dispatch(peer_id, env, conv=peer_id)
+        self.store.set_friend_status(peer_id, STATUS_BLOCKED)
+        return None
+
+    def verify_friend(self, peer_id):
+        c = self.store.get_contact(peer_id)
+        if not c or c.status != STATUS_FRIEND:
+            return "只能验证好友的指纹"
+        if not c.fingerprint:
+            return "该联系人暂无指纹信息"
+        self.store.mark_verified(peer_id, c.fingerprint)
+        return f"已确认 {c.nick}（{peer_id}）的指纹：{c.fingerprint}"
+
+    def _send_friend_accept(self, peer_id):
+        env = self._encrypted_env(protocol.TYPE_FRIEND_ACCEPT, peer_id, {"type": "friend_accept"})
+        if env is not None:
+            self._dispatch(peer_id, env, conv=peer_id)
+
+    def _become_friends(self, peer_id, notify=True, send_accept=False):
+        was_friend = self.is_friend(peer_id)
+        self.store.set_friend_status(peer_id, STATUS_FRIEND)
+        if send_accept:
+            self._send_friend_accept(peer_id)
+        if not was_friend:
+            self._send_peer_list(peer_id)
+            for n in self._friends():
+                if n != peer_id:
+                    self._send_peer_list(n, peers=[peer_id])
+        self._flush_pending_auto(peer_id)
+        if notify and not was_friend:
+            c = self.store.get_contact(peer_id)
+            nick = c.nick if c else peer_id[:8]
+            self._status(f"已与 {nick} 成为好友")
+
+    def _flush_pending_auto(self, peer_id):
+        pending = self._pending_auto.pop(peer_id, [])
+        for env, conv, uid in pending:
+            status, _ = self._dispatch(peer_id, env, conv=conv)
+            if status == "sent":
+                self.store.mark_history_sent(conv, uid)
+                if self.on_message_updated:
+                    self.on_message_updated(conv)
+
+    def _handle_friend_request(self, sender):
+        c = self.store.get_contact(sender)
+        if c and c.status == STATUS_BLOCKED:
+            self._status(f"已忽略被屏蔽用户 {sender[:8]} 的好友请求")
+            return
+        if c and c.status == STATUS_FRIEND:
+            self._send_friend_accept(sender)
+            return
+        self._become_friends(sender, send_accept=True)
+
+    def _handle_friend_accept(self, sender):
+        self._become_friends(sender, notify=True)
+
+    def _handle_friend_decline(self, sender):
+        c = self.store.get_contact(sender)
+        nick = c.nick if c else sender[:8]
+        self.store.set_friend_status(sender, STATUS_STRANGER)
+        self._status(f"{nick} 拒绝了你的好友请求")
+
+    # ---------- 消息收发 ----------
+
     def send_text(self, peer_id, text, group=None):
         if not text:
             return "消息不能为空"
+        c = self.store.get_contact(peer_id)
+        if not c or not c.x_pub_b64:
+            return "尚无对方公钥，请先连接或经中继获取"
+        if c.status == STATUS_BLOCKED:
+            return "你已屏蔽该用户，无法发送消息"
         body = {"type": "text", "text": text}
         if group:
             body["group"] = group
@@ -118,7 +244,14 @@ class Core:
         if env is None:
             return "找不到该联系人的密钥，请先建立连接或添加联系人"
         conv = group or peer_id
-        status, uid = self._dispatch(peer_id, env, conv=conv)
+        if self.is_friend(peer_id):
+            status, uid = self._dispatch(peer_id, env, conv=conv)
+        else:
+            self.request_friend(peer_id)
+            uid = uuid.uuid4().hex
+            self._pending_auto.setdefault(peer_id, []).append((env, conv, uid))
+            status = "queued"
+            self._status(f"已自动向 {c.nick} 发送好友请求，消息将在对方接受后送达")
         entry = self._me_entry(conv, body, status)
         if uid:
             entry["uid"] = uid
@@ -128,15 +261,26 @@ class Core:
 
     def send_group(self, channel, text):
         members = self.store.channel_members(channel)
-        if not members:
-            return f"频道 {channel} 还没有成员，请先用 /join 添加"
-        for m in members:
+        friends = [m for m in members if self.is_friend(m)]
+        if not friends:
+            return f"频道 {channel} 没有可发送的好友成员"
+        for m in friends:
             err = self.send_text(m, text, group=channel)
             if err:
                 return err
         return None
 
     def send_file(self, peer_id, path):
+        c = self.store.get_contact(peer_id)
+        if not c or not c.x_pub_b64:
+            return "尚无对方公钥，请先连接或经中继获取"
+        if c.status == STATUS_BLOCKED:
+            return "你已屏蔽该用户，无法发送文件"
+        if not self.is_friend(peer_id):
+            err = self.request_friend(peer_id)
+            if err:
+                return err
+            return "已自动发送好友请求，对方接受后请重新发送文件"
         path = Path(path)
         if not path.exists() or not path.is_file():
             return "文件不存在"
@@ -188,6 +332,9 @@ class Core:
 
     def _on_peer_change(self, peer_id, connected, info):
         if connected and info:
+            c = self.store.get_contact(peer_id)
+            old_status = c.status if c else STATUS_STRANGER
+            old_confirmed = c.confirmed_fingerprint if c else ""
             fp = self._fingerprint(info.get("x_pub", ""))
             self.store.update_contact_keys(
                 peer_id,
@@ -195,19 +342,32 @@ class Core:
                 info.get("x_pub", ""),
                 info.get("ed_pub", ""),
                 fp,
+                status=old_status,
             )
+            if old_status not in (STATUS_FRIEND, STATUS_BLOCKED):
+                self.store.set_friend_status(peer_id, STATUS_FRIEND)
+                self._status(f"已与 {info.get('nick', peer_id[:8])} 直连并自动成为好友")
+            if old_confirmed and fp and fp != old_confirmed:
+                nick = info.get("nick") or peer_id[:8]
+                self._status(
+                    f"【安全警告】好友 {nick} 的公钥指纹已变化（{fp}），"
+                    "可能是中间人攻击！请用 /finger 线下核对"
+                )
             self.flush_queued()
-            self._send_peer_list(peer_id)
-            for n in self.router.neighbors():
-                if n != peer_id:
-                    self._send_peer_list(n, peers=[peer_id])
+            if self.is_friend(peer_id):
+                self._send_peer_list(peer_id)
+                for n in self._friends():
+                    if n != peer_id:
+                        self._send_peer_list(n, peers=[peer_id])
         if self.on_peer:
             self.on_peer(peer_id, connected, info)
 
     def _send_peer_list(self, to_peer, peers=None):
+        if not self.is_friend(to_peer):
+            return
         entries = []
         for pid, c in self.store.contacts().items():
-            if pid == to_peer:
+            if pid == to_peer or c.status != STATUS_FRIEND:
                 continue
             if peers is not None and pid not in peers:
                 continue
@@ -236,6 +396,9 @@ class Core:
             protocol.TYPE_FILE_CHUNK,
             protocol.TYPE_FILE_ACK,
             protocol.TYPE_PEER_LIST,
+            protocol.TYPE_FRIEND_REQUEST,
+            protocol.TYPE_FRIEND_ACCEPT,
+            protocol.TYPE_FRIEND_DECLINE,
         ):
             return
         key = self._shared_key(env["src"])
@@ -255,6 +418,18 @@ class Core:
         c = self.store.get_contact(sender)
         nick = c.nick if c else sender[:8]
         t = body.get("type")
+        if t == "friend_request":
+            self._handle_friend_request(sender)
+            return
+        if t == "friend_accept":
+            self._handle_friend_accept(sender)
+            return
+        if t == "friend_decline":
+            self._handle_friend_decline(sender)
+            return
+        if not self.is_friend(sender):
+            self._status(f"已忽略来自非好友 {nick} 的消息（可先 /add {sender[:8]}）")
+            return
         if t == "peer_list":
             got = 0
             for p in body.get("peers", []):
@@ -267,10 +442,12 @@ class Core:
                 )
                 got += 1
             if got:
-                self._status(f"通过 {nick} 获取了 {got} 位联系人的公钥")
+                self._status(f"通过好友 {nick} 获取了 {got} 位联系人的公钥")
             return
         if t == "text":
             conv = body.get("group") or sender
+            if body.get("group"):
+                self._ensure_channel(body["group"], sender)
             entry = {
                 "role": "them",
                 "nick": nick,
@@ -305,6 +482,18 @@ class Core:
             st["parts"][body["index"]] = base64.b64decode(body["data"])
             if len(st["parts"]) >= st["total"]:
                 self._assemble_file(st)
+
+    def _ensure_channel(self, channel, sender):
+        members = self.store.channel_members(channel)
+        changed = False
+        if self.identity.peer_id not in members:
+            members.add(self.identity.peer_id)
+            changed = True
+        if sender not in members:
+            members.add(sender)
+            changed = True
+        if changed:
+            self.store.add_channel_member(channel, list(members))
 
     def _assemble_file(self, st):
         data = b"".join(st["parts"][i] for i in range(st["total"]))
