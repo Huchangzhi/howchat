@@ -114,17 +114,26 @@ class Store:
         self._atomic_write(self.channels_path, self._channels)
 
     def queued(self):
-        return list(self._queued)
+        return [self._rec_to_env(r) for r in self._queued]
 
-    def queue_outbound(self, envelope):
-        self._queued.append(envelope)
+    def queued_uids(self):
+        return [r.get("uid") for r in self._queued]
+
+    def queue_outbound(self, envelope, uid=None):
+        self._queued.append({"env": envelope, "uid": uid})
         self._atomic_write(self.queued_path, self._queued)
 
     def clear_queued(self, envelopes):
         dropped = [e for e in envelopes]
-        remaining = [env for env in self._queued if env not in dropped]
+        remaining = [r for r in self._queued if self._rec_to_env(r) not in dropped]
         self._queued = remaining
         self._atomic_write(self.queued_path, self._queued)
+
+    @staticmethod
+    def _rec_to_env(rec):
+        if isinstance(rec, dict) and "env" in rec:
+            return rec["env"]
+        return rec
 
     def history(self, conv_id):
         path = self.history_dir / f"{conv_id}.json"
@@ -140,6 +149,27 @@ class Store:
         items.append(entry)
         items = items[-2000:]
         self._atomic_write(self.history_dir / f"{conv_id}.json", items)
+
+    def mark_history_sent(self, conv_id, uid):
+        items = self.history(conv_id)
+        changed = False
+        for it in items:
+            if it.get("uid") == uid and it.get("status") == "queued":
+                it["status"] = "sent"
+                changed = True
+        if changed:
+            self._atomic_write(self.history_dir / f"{conv_id}.json", items)
+
+    def find_history_conv(self, uid):
+        for path in self.history_dir.glob("*.json"):
+            try:
+                items = json.loads(path.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                continue
+            for it in items:
+                if it.get("uid") == uid:
+                    return path.stem
+        return None
 
     def files_path(self):
         return self.files_dir

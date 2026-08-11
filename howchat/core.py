@@ -23,7 +23,9 @@ class Core:
         self.on_message = None
         self.on_peer = None
         self.on_status = None
+        self.on_message_updated = None
         self._file_rcv = {}
+        self._uid_conv = {}
         self.router.on_deliver = self._on_delivered
         for t in self.transports:
             t.on_peer_change = self._on_peer_change
@@ -98,11 +100,13 @@ class Core:
             ts=int(time.time()),
         )
 
-    def _dispatch(self, peer_id, env):
+    def _dispatch(self, peer_id, env, conv=None):
         if self.router.send(env):
-            return "sent"
-        self.store.queue_outbound(env)
-        return "queued"
+            return "sent", None
+        uid = uuid.uuid4().hex
+        self.store.queue_outbound(env, uid=uid)
+        self._uid_conv[uid] = conv
+        return "queued", uid
 
     def send_text(self, peer_id, text, group=None):
         if not text:
@@ -113,9 +117,11 @@ class Core:
         env = self._encrypted_env(protocol.TYPE_MSG, peer_id, body)
         if env is None:
             return "找不到该联系人的密钥，请先建立连接或添加联系人"
-        status = self._dispatch(peer_id, env)
         conv = group or peer_id
+        status, uid = self._dispatch(peer_id, env, conv=conv)
         entry = self._me_entry(conv, body, status)
+        if uid:
+            entry["uid"] = uid
         self.store.append_history(conv, entry)
         self._emit_message(conv, entry)
         return None
@@ -151,7 +157,7 @@ class Core:
         meta_env = self._encrypted_env(protocol.TYPE_FILE_META, peer_id, meta)
         if meta_env is None:
             return "找不到该联系人的密钥，请先建立连接"
-        self._dispatch(peer_id, meta_env)
+        self._dispatch(peer_id, meta_env, conv=peer_id)
         for i, chunk in enumerate(chunks):
             body = {
                 "type": "file_chunk",
@@ -160,7 +166,7 @@ class Core:
                 "data": base64.b64encode(chunk).decode(),
             }
             env = self._encrypted_env(protocol.TYPE_FILE_CHUNK, peer_id, body)
-            self._dispatch(peer_id, env)
+            self._dispatch(peer_id, env, conv=peer_id)
         entry = self._me_entry(peer_id, {"type": "text", "text": f"发送文件：{path.name}（{len(data)} 字节）"}, "sent")
         self.store.append_history(peer_id, entry)
         self._emit_message(peer_id, entry)
@@ -324,12 +330,27 @@ class Core:
             self._file_rcv.pop(key, None)
 
     def flush_queued(self):
+        queued = self.store.queued()
+        uids = self.store.queued_uids()
+        if not queued:
+            return
         sent = []
-        for env in self.store.queued():
+        updated_convs = set()
+        for i, env in enumerate(queued):
             if self.router.send(env):
                 sent.append(env)
+                uid = uids[i] if i < len(uids) else None
+                if uid:
+                    conv = self._uid_conv.get(uid) or self.store.find_history_conv(uid)
+                    if conv:
+                        self.store.mark_history_sent(conv, uid)
+                        updated_convs.add(conv)
+                    self._uid_conv.pop(uid, None)
         if sent:
             self.store.clear_queued(sent)
+        for conv in updated_convs:
+            if self.on_message_updated:
+                self.on_message_updated(conv)
 
     async def _flush_loop(self):
         while True:

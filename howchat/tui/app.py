@@ -1,6 +1,8 @@
 import time
 from pathlib import Path
 
+from rich.markup import escape as escape_markup
+
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
@@ -49,6 +51,12 @@ class StatusEvent(Message):
         self.text = text
 
 
+class ConversationUpdated(Message):
+    def __init__(self, conv):
+        super().__init__()
+        self.conv = conv
+
+
 class HowchatApp(App):
     TITLE = "howchat"
     CSS = """
@@ -91,6 +99,7 @@ class HowchatApp(App):
         self.core.on_message = self._notify_message
         self.core.on_peer = self._notify_peer
         self.core.on_status = self._notify_status
+        self.core.on_message_updated = self._notify_message_updated
         await self.core.start(broadcast=self.broadcast)
         port = getattr(self.core.transport, "tcp_port", None)
         port_str = f"  端口：{port}" if port else ""
@@ -111,6 +120,9 @@ class HowchatApp(App):
     def _notify_status(self, text):
         self.post_message(StatusEvent(text))
 
+    def _notify_message_updated(self, conv):
+        self.post_message(ConversationUpdated(conv))
+
     def on_incoming_message(self, msg: IncomingMessage):
         self._render_entry(msg.entry)
         if msg.entry.get("conv") != self.current:
@@ -126,8 +138,12 @@ class HowchatApp(App):
     def on_status_event(self, msg: StatusEvent):
         self._status(msg.text)
 
+    def on_conversation_updated(self, msg: ConversationUpdated):
+        if self.current == msg.conv:
+            self._switch_conv(self.current)
+
     def _status(self, text):
-        self.status.update(text)
+        self.status.update(escape_markup(text))
 
     def _contact_display(self, peer_id):
         c = self.core.store.get_contact(peer_id)
@@ -174,8 +190,8 @@ class HowchatApp(App):
 
     def _render_entry(self, entry):
         ts = time.strftime("%H:%M", time.localtime(entry.get("ts", 0)))
-        role = "我" if entry.get("role") == "me" else entry.get("nick", "?")
-        text = entry.get("text", "")
+        role = escape_markup("我" if entry.get("role") == "me" else entry.get("nick", "?"))
+        text = escape_markup(entry.get("text", ""))
         mark = ""
         if entry.get("role") == "me" and entry.get("status") == "queued":
             mark = " [orange3][排队中][/]"
@@ -183,7 +199,7 @@ class HowchatApp(App):
 
     def _write_system(self, text):
         ts = time.strftime("%H:%M", time.localtime())
-        self.messages.write(f"[dim]{ts} [系统][/dim] {text}")
+        self.messages.write(f"[dim]{ts} [系统][/dim] {escape_markup(text)}")
 
     async def on_input_submitted(self, event):
         text = event.value.strip()

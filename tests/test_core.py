@@ -196,3 +196,61 @@ async def run_group_test():
 
 def test_core_group():
     asyncio.run(run_group_test())
+
+
+async def run_queued_sent_test():
+    d1 = tempfile.mkdtemp()
+    d2 = tempfile.mkdtemp()
+    ida = identity_mod.load_or_create(os.path.join(d1, "data"))
+    idb = identity_mod.load_or_create(os.path.join(d2, "data"))
+
+    class ToggleRouter(Router):
+        def __init__(self, peer_id):
+            super().__init__(peer_id)
+            self.online = False
+
+        def send(self, env):
+            return self.online
+
+    ra = ToggleRouter(ida.peer_id)
+    ta = LANTransport(ida, ra, host="127.0.0.1", tcp_port=40701)
+    store_a = Store(os.path.join(d1, "store"))
+    ca = Core(ida, store_a, ra, ta)
+
+    updated = []
+
+    def on_updated(conv):
+        updated.append(conv)
+
+    ca.on_message_updated = on_updated
+    await ca.start(broadcast=False)
+
+    import base64
+
+    store_a.update_contact_keys(
+        idb.peer_id,
+        "乙",
+        base64.b64encode(ida.x_pub_bytes()).decode(),
+        base64.b64encode(ida.ed_pub_bytes()).decode(),
+    )
+
+    ra.online = False
+    err = ca.send_text(idb.peer_id, "离线排队消息")
+    assert err is None, err
+    assert store_a.queued(), "消息应进入离线队列"
+    entry = store_a.history(idb.peer_id)[-1]
+    assert entry["status"] == "queued", "历史条目应为排队状态"
+    assert not updated, "离线时不应触发更新回调"
+
+    ra.online = True
+    ca.flush_queued()
+    assert not store_a.queued(), "连接后应清空排队队列"
+    entry = store_a.history(idb.peer_id)[-1]
+    assert entry["status"] == "sent", "连接后排队状态应更新为已发送"
+    assert updated == [idb.peer_id], "应通知 TUI 刷新会话"
+
+    await ca.stop()
+
+
+def test_core_queued_history_status():
+    asyncio.run(run_queued_sent_test())
