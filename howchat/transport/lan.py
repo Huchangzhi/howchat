@@ -4,6 +4,7 @@ import ipaddress
 import json
 import socket
 import struct
+import time
 
 from howchat import protocol
 from howchat.routing import ReplayError
@@ -13,9 +14,10 @@ DISCOVERY_PORT = 41234
 TCP_PORT = 41235
 BEACON_INTERVAL = 5.0
 DISCOVERY_ADDR = "255.255.255.255"
-SCAN_INTERVAL = 60.0
+SCAN_INTERVAL = 15.0
 SCAN_TIMEOUT = 0.4
 SCAN_MAX_HOSTS = 2048
+SCAN_PORT_RANGE = 6
 
 
 class LANTransport(Transport):
@@ -28,7 +30,7 @@ class LANTransport(Transport):
         self.discovery_port = discovery_port
         self._connections = {}
         self._known = {}
-        self._scanned = set()
+        self._scanned = {}
         self._server = None
         self._discovery = None
         self._tasks = []
@@ -54,6 +56,8 @@ class LANTransport(Transport):
                 ]
             )
         self._tasks = tasks
+        if broadcast:
+            loop.create_task(self._scan_once())
 
     async def _bind_tcp(self):
         for port in range(self.tcp_port, self.tcp_port + 50):
@@ -90,7 +94,6 @@ class LANTransport(Transport):
         loop = asyncio.get_running_loop()
         loop.create_task(self._handshake(reader, writer))
         return True
-
     def _accept(self, reader, writer):
         loop = asyncio.get_running_loop()
         loop.create_task(self._handshake(reader, writer))
@@ -184,7 +187,7 @@ class LANTransport(Transport):
                 continue
             peer_port = info.get("tcp_port", self.tcp_port)
             self._known[peer_id] = (addr[0], peer_port)
-            if peer_id not in self._connections and self.identity.peer_id < peer_id:
+            if peer_id not in self._connections:
                 loop.create_task(self.connect_host(addr[0], peer_port))
 
     def _scan_hosts(self):
@@ -211,7 +214,14 @@ class LANTransport(Transport):
     async def _scan_once(self):
         hosts = self._scan_hosts()
         own = self._own_addrs()
-        targets = [h for h in hosts if h not in own and h not in self._scanned]
+        now = time.time()
+        targets = [
+            h
+            for h in hosts
+            if h not in own
+            and (now - self._scanned.get(h, 0) > SCAN_INTERVAL)
+            and h not in {a[0] for a in self._known.values()}
+        ]
         if not targets:
             return
         loop = asyncio.get_running_loop()
@@ -220,22 +230,23 @@ class LANTransport(Transport):
             await asyncio.gather(*tasks)
 
     async def _probe(self, ip):
-        try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(ip, TCP_PORT), timeout=SCAN_TIMEOUT
-            )
-        except (OSError, asyncio.TimeoutError):
-            self._scanned.add(ip)
+        self._scanned[ip] = time.time()
+        for port in range(TCP_PORT, TCP_PORT + SCAN_PORT_RANGE):
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(ip, port), timeout=SCAN_TIMEOUT
+                )
+            except (OSError, asyncio.TimeoutError):
+                continue
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+            if ip not in {a[0] for a in self._known.values()}:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self.connect_host(ip, port))
             return
-        self._scanned.add(ip)
-        try:
-            writer.close()
-            await writer.wait_closed()
-        except Exception:
-            pass
-        if ip not in {a[0] for a in self._known.values()}:
-            loop = asyncio.get_running_loop()
-            loop.create_task(self.connect_host(ip, TCP_PORT))
 
     def _peer_info(self):
         return {
