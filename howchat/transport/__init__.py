@@ -2,6 +2,8 @@ import abc
 
 
 class Transport(abc.ABC):
+    kind = "base"
+
     def __init__(self, identity, router):
         self.identity = identity
         self.router = router

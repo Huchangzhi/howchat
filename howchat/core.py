@@ -13,29 +13,41 @@ FLUSH_INTERVAL = 5.0
 
 
 class Core:
-    def __init__(self, identity, store, router, transport):
+    def __init__(self, identity, store, router, transport, extra_transports=None):
         self.identity = identity
         self.store = store
         self.router = router
         self.transport = transport
+        self.extra_transports = list(extra_transports or [])
+        self.transports = [self.transport] + self.extra_transports
         self.on_message = None
         self.on_peer = None
         self.on_status = None
         self._file_rcv = {}
         self.router.on_deliver = self._on_delivered
-        self.transport.on_peer_change = self._on_peer_change
+        for t in self.transports:
+            t.on_peer_change = self._on_peer_change
         self._flush_task = None
 
     async def start(self, broadcast=True):
-        await self.transport.start(broadcast=broadcast)
+        for t in self.transports:
+            await t.start(broadcast=broadcast)
         self._flush_task = asyncio.get_running_loop().create_task(self._flush_loop())
 
     async def stop(self):
         if self._flush_task:
             self._flush_task.cancel()
+        for t in self.transports:
+            await t.stop()
 
     async def connect_host(self, addr, port):
         return await self.transport.connect_host(addr, port)
+
+    def connect_bluetooth(self, mac, port=None):
+        for t in self.transports:
+            if getattr(t, "kind", "") == "bluetooth" and t.available:
+                return t.connect_host(mac, port or getattr(t, "channel", 4))
+        return None
 
     def discover(self, dst):
         self.router.discover(dst)
@@ -180,7 +192,7 @@ class Core:
             )
             self.flush_queued()
             self._send_peer_list(peer_id)
-            for n in self.transport.neighbors():
+            for n in self.router.neighbors():
                 if n != peer_id:
                     self._send_peer_list(n, peers=[peer_id])
         if self.on_peer:

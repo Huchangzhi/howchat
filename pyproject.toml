@@ -10,7 +10,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-bluetooth = ["pybluez"]
+bluetooth = ["pybluez; sys_platform != 'win32'", "pybluez2; sys_platform == 'win32'"]
 dev = ["pytest"]
 
 [project.scripts]

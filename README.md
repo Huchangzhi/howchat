@@ -7,7 +7,7 @@
 - **端到端加密**：X25519 密钥交换 + AES-256-GCM 加密 + Ed25519 签名，中继节点只能转发、无法读取内容。
 - **中继跳转**：可通过中间用户作为跳板，向未直连的目标发送消息。
 - **文字 + 文件**：私聊、公共群聊，支持分块传输文件。
-- **支持 Windows / Linux**，蓝牙传输预留扩展点（见下文）。
+- **支持 Windows / Linux**，局域网 + 蓝牙双传输、中继跳转。
 
 ## 安装
 
@@ -94,18 +94,36 @@ howchat/
 ├── protocol.py     # 信封编解码、分帧、签名
 ├── routing.py      # 路由表、中继转发、路由发现、防重放
 ├── transport/
-│   ├── __init__.py # 传输抽象（蓝牙扩展点）
-│   └── lan.py      # UDP 发现 + TCP 消息
+│   ├── __init__.py # 传输抽象基类
+│   ├── lan.py      # UDP 发现 + TCP 消息
+│   └── bluetooth.py# RFCOMM 蓝牙传输（pybluez / pybluez2）
 ├── store.py        # 联系人 / 群组 / 离线队列 / 历史 / 文件
 ├── core.py         # 会话逻辑：加解密收发、群聊、文件分块
 └── tui/app.py      # textual 界面 + 命令
 ```
 
-## 蓝牙扩展点
+## 蓝牙传输
 
-传输层抽象为 `Transport`（见 `transport/__init__.py`），未来可实现 `BluetoothTransport`
-（Linux 使用 `pybluez` + BlueZ），实现接口：`start / stop / neighbors / send_frame / connect_host`。
-安装可选依赖：`pip install -e '.[bluetooth]'`。
+howchat 已内置蓝牙传输（`transport/bluetooth.py`），与局域网传输同时运行，消息自动选择可达链路。
+
+- Linux：安装 `pybluez`（需要 BlueZ 与系统蓝牙库）
+- Windows：安装 `pybluez2`
+
+```bash
+pip install -e '.[bluetooth]'
+```
+
+启动后默认自动启用蓝牙（无 pybluez 时自动跳过），可用 `--no-bluetooth` 禁用。
+
+TUI 命令：
+
+```
+/bt scan                扫描附近运行 howchat 的蓝牙设备（约 4 秒）
+/bt connect <MAC[:频道]> 手动连接蓝牙设备（默认频道 4）
+/bt peers               查看当前蓝牙邻居
+```
+
+蓝牙与局域网互不干扰：`transport_for` 按传输注册顺序优先返回局域网，只有局域网不可达时才回退到蓝牙；同一邻居经任一链路可达即视为在线。路由发现/中继请求会同时发往两个传输的所有邻居。
 
 ## 测试
 

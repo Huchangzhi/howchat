@@ -15,6 +15,8 @@ DISCOVERY_ADDR = "255.255.255.255"
 
 
 class LANTransport(Transport):
+    kind = "lan"
+
     def __init__(self, identity, router, host="0.0.0.0", tcp_port=TCP_PORT, discovery_port=DISCOVERY_PORT):
         super().__init__(identity, router)
         self.host = host
@@ -25,7 +27,7 @@ class LANTransport(Transport):
         self._server = None
         self._discovery = None
         self._tasks = []
-        router.set_transport(self)
+        router.add_transport(self)
 
     def neighbors(self):
         return set(self._connections.keys())

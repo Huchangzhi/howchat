@@ -17,6 +17,9 @@ HELP_TEXT = """\
   /leave <#频道>              离开群聊
   /sendfile <目标> <路径>      发送文件（支持中继转发）
   /hop <目标> <跳板IP[:端口]>  通过跳板节点连接目标
+  /bt scan                    扫描附近蓝牙 howchat 设备
+  /bt connect <MAC[:频道]>     手动连接蓝牙设备（默认频道 4）
+  /bt peers                   查看蓝牙邻居
   /nick <新昵称>              修改自己的昵称
   /finger <目标>              查看对端公钥指纹（用于身份校验）
   /whoami                     查看自己的 ID 与指纹
@@ -133,7 +136,7 @@ class HowchatApp(App):
         return peer_id[:8]
 
     def _refresh_contacts(self):
-        online = self.core.transport.neighbors()
+        online = self.core.router.neighbors()
         contacts = self.core.store.contacts()
         items = []
         for peer_id in sorted(contacts):
@@ -224,12 +227,14 @@ class HowchatApp(App):
             ok = await self.core.connect_host(ip, port)
             self._status("正在连接……" if ok else f"连接 {ip}:{port} 失败")
         elif cmd == "peers":
-            online = self.core.transport.neighbors()
+            online = self.core.router.neighbors()
             if not online:
                 self._status("当前没有在线用户")
             else:
                 names = ", ".join(self._contact_display(p) for p in sorted(online))
                 self._status(f"在线用户：{names}")
+        elif cmd == "bt":
+            return await self._bt_command(args)
         elif cmd == "msg":
             if not args:
                 return self._status("用法：/msg <昵称或ID>")
@@ -243,7 +248,7 @@ class HowchatApp(App):
             channel = args[0] if args[0].startswith("#") else "#" + args[0]
             members = args[1:]
             if not members:
-                members = list(self.core.transport.neighbors())
+                members = list(self.core.router.neighbors())
             self.core.store.add_channel_member(channel, members)
             self._status(f"已加入频道 {channel}，成员：{', '.join(members) or '无'}")
             self._refresh_contacts()
@@ -316,4 +321,44 @@ class HowchatApp(App):
                 return pid
         if name.startswith("#"):
             return None
+        return None
+
+    async def _bt_command(self, args):
+        if not args:
+            return self._status("用法：/bt scan | /bt connect <MAC[:频道]> | /bt peers")
+        sub = args[0].lower()
+        bt = self._bt_transport()
+        if bt is None:
+            return self._status("蓝牙不可用（未安装 pybluez 或没有蓝牙适配器）")
+        if sub == "scan":
+            self._status("正在扫描蓝牙设备（约 4 秒）……")
+            devices = await bt.scan()
+            if not devices:
+                return self._status("未发现运行 howchat 的蓝牙设备")
+            lines = [f"{mac} (频道 {port})" for mac, port, _name in devices]
+            self._status("发现设备：" + " | ".join(lines))
+            return None
+        if sub == "connect":
+            if len(args) < 2:
+                return self._status("用法：/bt connect <MAC[:频道]>")
+            target = args[1].lower()
+            if ":" in target:
+                mac, port = target.rsplit(":", 1)
+                port = int(port)
+            else:
+                mac, port = target, 4
+            ok = await self.core.connect_bluetooth(mac, port)
+            return self._status("正在连接蓝牙……" if ok else f"连接蓝牙 {mac} 失败")
+        if sub == "peers":
+            peers = bt.neighbors() if bt.available else set()
+            if not peers:
+                return self._status("当前没有蓝牙邻居")
+            names = ", ".join(self._contact_display(p) for p in sorted(peers))
+            return self._status(f"蓝牙邻居：{names}")
+        return self._status("用法：/bt scan | /bt connect <MAC[:频道]> | /bt peers")
+
+    def _bt_transport(self):
+        for t in self.core.transports:
+            if getattr(t, "kind", "") == "bluetooth":
+                return t
         return None

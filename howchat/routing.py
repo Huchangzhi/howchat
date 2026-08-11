@@ -17,14 +17,30 @@ class RoutingEntry:
 class Router:
     def __init__(self, peer_id):
         self.peer_id = peer_id
-        self.transport = None
+        self.transports = []
         self.table = {}
         self._seen = set()
         self.on_deliver = None
         self._seq = 0
 
+    def add_transport(self, transport):
+        if transport not in self.transports:
+            self.transports.append(transport)
+
     def set_transport(self, transport):
-        self.transport = transport
+        self.transports = [transport]
+
+    def transport_for(self, peer_id):
+        for t in self.transports:
+            if peer_id in t.neighbors():
+                return t
+        return None
+
+    def send_frame(self, peer_id, frame):
+        t = self.transport_for(peer_id)
+        if t is None:
+            return False
+        return t.send_frame(peer_id, frame)
 
     def next_seq(self):
         self._seq += 1
@@ -34,13 +50,17 @@ class Router:
         self.table[peer_id] = RoutingEntry(peer_id, hops, time.time())
 
     def remove_neighbor(self, peer_id):
-        self.table.pop(peer_id, None)
+        if self.transport_for(peer_id) is None:
+            self.table.pop(peer_id, None)
 
     def route_to(self, dst):
         return self.table.get(dst)
 
     def neighbors(self):
-        return self.transport.neighbors() if self.transport else set()
+        result = set()
+        for t in self.transports:
+            result |= t.neighbors()
+        return result
 
     def send(self, envelope):
         dst = envelope["dst"]
@@ -70,8 +90,7 @@ class Router:
         out["ttl"] = envelope["ttl"] - 1
         if out.get("route"):
             out["route"] = envelope["route"][1:]
-        self.transport.send_frame(next_hop, protocol.pack_envelope(out))
-        return True
+        return self.send_frame(next_hop, protocol.pack_envelope(out))
 
     def forward(self, envelope, via=None):
         self._replay_check(envelope)
@@ -95,8 +114,6 @@ class Router:
             self.on_deliver(envelope)
 
     def discover(self, dst):
-        if not self.transport:
-            return
         env = {
             "v": 1,
             "type": protocol.TYPE_ROUTE_REQUEST,
@@ -107,8 +124,10 @@ class Router:
             "seq": self.next_seq(),
             "ts": int(time.time()),
         }
-        for n in self.neighbors():
-            self.transport.send_frame(n, protocol.pack_envelope(env))
+        frame = protocol.pack_envelope(env)
+        for t in self.transports:
+            for n in t.neighbors():
+                t.send_frame(n, frame)
 
     def _handle_route_request(self, req, via):
         if req["ttl"] <= 0:
@@ -127,10 +146,12 @@ class Router:
         out = dict(req)
         out["route"] = visited + [self.peer_id]
         out["ttl"] = req["ttl"] - 1
-        for n in self.neighbors():
-            if n == via or n in visited:
-                continue
-            self.transport.send_frame(n, protocol.pack_envelope(out))
+        frame = protocol.pack_envelope(out)
+        for t in self.transports:
+            for n in t.neighbors():
+                if n == via or n in visited:
+                    continue
+                t.send_frame(n, frame)
 
     def _reply_route(self, via, req, target, hops):
         return_route = list(reversed(req["route"]))[1:]
@@ -146,7 +167,7 @@ class Router:
             "seq": self.next_seq(),
             "ts": int(time.time()),
         }
-        self.transport.send_frame(via, protocol.pack_envelope(env))
+        self.send_frame(via, protocol.pack_envelope(env))
 
     def _handle_route_reply(self, reply, via):
         target = reply["target"]

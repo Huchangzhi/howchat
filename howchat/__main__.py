@@ -5,6 +5,7 @@ from howchat import identity as identity_mod
 from howchat.core import Core
 from howchat.routing import Router
 from howchat.store import Store
+from howchat.transport.bluetooth import BluetoothTransport
 from howchat.transport.lan import LANTransport
 from howchat.tui.app import HowchatApp
 
@@ -20,6 +21,11 @@ def main():
     )
     parser.add_argument("--host", default="0.0.0.0", help="监听地址")
     parser.add_argument("--port", type=int, default=41235, help="监听端口，默认 41235")
+    parser.add_argument(
+        "--no-bluetooth",
+        action="store_true",
+        help="禁用蓝牙传输（无 pybluez 时自动禁用）",
+    )
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir).expanduser()
@@ -27,7 +33,10 @@ def main():
     store = Store(data_dir / "store")
     router = Router(identity.peer_id)
     transport = LANTransport(identity, router, host=args.host, tcp_port=args.port)
-    core = Core(identity, store, router, transport)
+    extra = []
+    if not args.no_bluetooth:
+        extra.append(BluetoothTransport(identity, router))
+    core = Core(identity, store, router, transport, extra_transports=extra)
     core.data_dir = data_dir
     HowchatApp(core).run()
 

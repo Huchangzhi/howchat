@@ -129,3 +129,43 @@ def test_replay_detection():
         assert False, "应检测到重放"
     except ReplayError:
         pass
+
+
+def test_multi_transport_priority():
+    r = Router("a")
+    lan = FakeTransport("a")
+    bt = FakeTransport("a")
+    r.add_transport(lan)
+    r.add_transport(bt)
+    lan.set_neighbors("b")
+    bt.set_neighbors("b", "c")
+
+    assert r.neighbors() == {"b", "c"}
+    assert r.transport_for("b") is lan
+    assert r.transport_for("c") is bt
+
+    assert r.send_frame("b", protocol.pack_envelope(make_msg("a", "b"))) is None
+    assert "b" in lan.sent
+    assert "b" not in bt.sent
+
+    assert r.send_frame("c", protocol.pack_envelope(make_msg("a", "c"))) is None
+    assert "c" in bt.sent
+
+
+def test_remove_neighbor_keeps_alt_transport():
+    r = Router("a")
+    lan = FakeTransport("a")
+    bt = FakeTransport("a")
+    r.add_transport(lan)
+    r.add_transport(bt)
+    lan.set_neighbors("b")
+    bt.set_neighbors("b")
+    r.add_neighbor("b")
+
+    bt.set_neighbors()
+    r.remove_neighbor("b")
+    assert r.route_to("b") is not None
+
+    lan.set_neighbors()
+    r.remove_neighbor("b")
+    assert r.route_to("b") is None
