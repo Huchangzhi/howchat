@@ -34,9 +34,7 @@ class LANTransport(Transport):
         return dict(self._known)
 
     async def start(self, broadcast=True):
-        self._server = await asyncio.start_server(
-            self._accept, self.host, self.tcp_port
-        )
+        self.tcp_port = await self._bind_tcp()
         self._discovery = self._open_discovery()
         loop = asyncio.get_running_loop()
         tasks = []
@@ -48,6 +46,15 @@ class LANTransport(Transport):
                 ]
             )
         self._tasks = tasks
+
+    async def _bind_tcp(self):
+        for port in range(self.tcp_port, self.tcp_port + 50):
+            try:
+                self._server = await asyncio.start_server(self._accept, self.host, port)
+                return port
+            except OSError:
+                continue
+        raise OSError(f"无法监听端口 {self.tcp_port}~{self.tcp_port + 49}")
 
     async def stop(self):
         for task in self._tasks:
@@ -93,15 +100,43 @@ class LANTransport(Transport):
         sock.setblocking(False)
         return sock
 
-    async def _beacon_loop(self):
-        beacon = json.dumps(
+    def _beacon_bytes(self):
+        return json.dumps(
             {"id": self.identity.peer_id, "nick": self.identity.nick, "tcp_port": self.tcp_port}
         ).encode("utf-8")
-        while True:
+
+    def _broadcast_targets(self):
+        targets = [DISCOVERY_ADDR]
+        sb = self._subnet_broadcast()
+        if sb:
+            targets.append(sb)
+        return targets
+
+    def _subnet_broadcast(self):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+        except OSError:
+            return None
+        if "." not in ip:
+            return None
+        return ".".join(ip.split(".")[:3]) + ".255"
+
+    def _send_broadcast(self):
+        beacon = self._beacon_bytes()
+        for target in self._broadcast_targets():
             try:
-                self._discovery.sendto(beacon, (DISCOVERY_ADDR, self.discovery_port))
+                self._discovery.sendto(beacon, (target, self.discovery_port))
             except OSError:
                 pass
+
+    async def _beacon_loop(self):
+        while True:
+            for _ in range(3):
+                self._send_broadcast()
+                await asyncio.sleep(0.15)
             await asyncio.sleep(BEACON_INTERVAL)
 
     async def _discovery_loop(self):

@@ -89,7 +89,9 @@ class HowchatApp(App):
         self.core.on_peer = self._notify_peer
         self.core.on_status = self._notify_status
         await self.core.start(broadcast=self.broadcast)
-        self._status(f"已启动。本机 ID：{self.core.identity.peer_id}  昵称：{self.core.identity.nick}")
+        port = getattr(self.core.transport, "tcp_port", None)
+        port_str = f"  端口：{port}" if port else ""
+        self._status(f"已启动。本机 ID：{self.core.identity.peer_id}  昵称：{self.core.identity.nick}{port_str}")
         self._status(f"本机指纹：{self.core.identity.fingerprint}")
         self._refresh_contacts()
         self._switch_conv(None)
