@@ -191,7 +191,7 @@ class Store:
         items = self.history(conv_id)
         changed = False
         for it in items:
-            if it.get("uid") == uid and it.get("status") == "queued":
+            if it.get("uid") == uid and it.get("status") in ("queued", "waiting"):
                 it["status"] = "sent"
                 changed = True
         if changed:

@@ -233,11 +233,7 @@ async def run_bt_pair():
             await asyncio.sleep(0.02)
         assert idb.peer_id in ta.neighbors(), "A 未注册 B"
         assert ida.peer_id in tb.neighbors(), "B 未注册 A"
-        for _ in range(300):
-            if ca.is_friend(idb.peer_id) and cb.is_friend(ida.peer_id):
-                break
-            await asyncio.sleep(0.02)
-        assert ca.is_friend(idb.peer_id) and cb.is_friend(ida.peer_id), "蓝牙握手后应自动成为好友"
+        assert not ca.is_friend(idb.peer_id), "蓝牙直连不应自动成为好友"
 
         err = ca.send_text(idb.peer_id, "蓝牙消息你好")
         assert err is None, err

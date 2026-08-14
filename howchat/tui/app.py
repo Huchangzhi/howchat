@@ -86,6 +86,15 @@ class ConversationUpdated(Message):
         self.conv = conv
 
 
+class FileRequestMessage(Message):
+    def __init__(self, sender, file_id, name, size):
+        super().__init__()
+        self.sender = sender
+        self.file_id = file_id
+        self.name = name
+        self.size = size
+
+
 # ---------------------------------------------------------------------------
 # 命令面板
 # ---------------------------------------------------------------------------
@@ -311,6 +320,37 @@ class FilePickDialog(DialogScreen):
         self.dismiss(None)
 
 
+class FileConfirmDialog(DialogScreen):
+    """收到文件时询问用户是否接受。"""
+
+    BINDINGS = [Binding("escape", "dismiss", "拒绝", show=False)]
+
+    def __init__(self, sender, file_id, name, size):
+        super().__init__()
+        self._sender = sender
+        self._file_id = file_id
+        self._name = name
+        self._file_size = size
+
+    def compose(self) -> ComposeResult:
+        nick = self.app._contact_display(self._sender)
+        with Vertical(id="dialog"):
+            yield Label("收到文件请求", id="dlg-title")
+            yield Label(f"{nick} 想给你发送文件：\n\n  {self._name}（{self._file_size} 字节）\n\n是否接收？")
+            with Horizontal(id="dlg-buttons"):
+                yield Button("接受", variant="primary", id="accept")
+                yield Button("拒绝", variant="error", id="reject")
+
+    def on_button_pressed(self, event):
+        if event.button.id == "accept":
+            self.dismiss((self._file_id, True))
+        elif event.button.id == "reject":
+            self.dismiss((self._file_id, False))
+
+    def action_dismiss(self):
+        self.dismiss(None)
+
+
 # ---------------------------------------------------------------------------
 # 主界面
 # ---------------------------------------------------------------------------
@@ -373,6 +413,7 @@ class HowchatApp(App):
         self.core.on_peer = self._notify_peer
         self.core.on_status = self._notify_status
         self.core.on_message_updated = self._notify_message_updated
+        self.core.on_file_request = self._notify_file_request
         await self.core.start(broadcast=self.broadcast)
         port = getattr(self.core.transport, "tcp_port", None)
         port_str = f"  端口：{port}" if port else ""
@@ -397,6 +438,26 @@ class HowchatApp(App):
 
     def _notify_message_updated(self, conv):
         self.post_message(ConversationUpdated(conv))
+
+    def _notify_file_request(self, sender, file_id, name, size):
+        self.post_message(FileRequestMessage(sender, file_id, name, size))
+
+    def on_file_request_message(self, msg: FileRequestMessage):
+        self.push_screen(
+            FileConfirmDialog(msg.sender, msg.file_id, msg.name, msg.size),
+            self._on_file_confirm,
+        )
+
+    def _on_file_confirm(self, result):
+        if not result:
+            return
+        file_id, accept = result
+        if accept:
+            self.core.accept_file(file_id)
+            self._status("已接受文件，开始接收")
+        else:
+            self.core.reject_file(file_id)
+            self._status("已拒绝接收文件")
 
     def on_incoming_message(self, msg: IncomingMessage):
         self._render_entry(msg.entry)
@@ -498,8 +559,11 @@ class HowchatApp(App):
         role = escape_markup("我" if entry.get("role") == "me" else entry.get("nick", "?"))
         text = escape_markup(entry.get("text", ""))
         mark = ""
-        if entry.get("role") == "me" and entry.get("status") == "queued":
-            mark = " [orange3][排队中][/]"
+        if entry.get("role") == "me":
+            if entry.get("status") == "queued":
+                mark = " [orange3][排队中][/]"
+            elif entry.get("status") == "waiting":
+                mark = " [orange3][等待对方接受][/]"
         self.messages.write(f"[b]{ts} {role}:[/]{mark}\n    {text}")
 
     def _write_system(self, text):
@@ -695,14 +759,22 @@ class HowchatApp(App):
         if not self.current:
             return self._status("请先选择一个会话")
         is_group = self.current.startswith("#")
-        options = [
-            ("发送文件", "sendfile", is_group),
-            ("验证对端指纹（防中间人）", "verify", is_group),
-            ("查看对端指纹", "finger", is_group),
-            ("屏蔽联系人", "reject", is_group),
-            ("离开群聊", "leave", not is_group),
-            ("查看频道成员", "members", not is_group),
-        ]
+        if is_group:
+            options = [
+                ("离开群聊", "leave", False),
+                ("查看频道成员", "members", False),
+            ]
+        else:
+            c = self.core.store.get_contact(self.current)
+            is_friend = bool(c and c.status == STATUS_FRIEND)
+            options = []
+            if is_friend:
+                options.append(("发送文件", "sendfile", False))
+                options.append(("验证对端指纹（防中间人）", "verify", False))
+            else:
+                options.append(("发送好友申请", "friend", False))
+            options.append(("查看对端指纹", "finger", False))
+            options.append(("屏蔽联系人", "reject", False))
         self.push_screen(OptionMenuDialog(f"会话操作：{self._conv_label()}", options), self._do_conv_action)
 
     def _conv_label(self):
@@ -742,6 +814,14 @@ class HowchatApp(App):
                     self._refresh_contacts()
                     if self.current == peer_id:
                         self._switch_conv(None)
+        elif result == "friend":
+            if peer_id:
+                err = self.core.request_friend(peer_id)
+                if err:
+                    self._status(err)
+                else:
+                    self._status(f"已向 {self._contact_display(peer_id)} 发送好友申请")
+                    self._refresh_contacts()
         elif result == "leave":
             self.core.store.remove_channel_member(self.current, [self.core.identity.peer_id])
             self._status(f"已离开频道 {self.current}")
@@ -763,6 +843,8 @@ class HowchatApp(App):
 
     async def _run_command(self, raw):
         parts = raw[1:].split()
+        if not parts:
+            return self._status("命令不能为空")
         cmd = parts[0].lower()
         args = parts[1:]
         try:

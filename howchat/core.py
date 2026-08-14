@@ -25,7 +25,10 @@ class Core:
         self.on_peer = None
         self.on_status = None
         self.on_message_updated = None
+        self.on_file_request = None
         self._file_rcv = {}
+        self._file_out = {}
+        self._pending_file_req = {}
         self._uid_conv = {}
         self._pending_auto = {}
         self.router.on_deliver = self._on_delivered
@@ -328,18 +331,104 @@ class Core:
         if meta_env is None:
             return "找不到该联系人的密钥，请先建立连接"
         self._dispatch(peer_id, meta_env, conv=peer_id)
-        for i, chunk in enumerate(chunks):
-            body = {
-                "type": "file_chunk",
-                "file_id": file_id,
-                "index": i,
-                "data": base64.b64encode(chunk).decode(),
-            }
-            env = self._encrypted_env(protocol.TYPE_FILE_CHUNK, peer_id, body)
-            self._dispatch(peer_id, env, conv=peer_id)
-        entry = self._me_entry(peer_id, {"type": "text", "text": f"发送文件：{path.name}（{len(data)} 字节）"}, "sent")
+        # 保存待确认的文件：等待对方同意后再发送数据块
+        self._file_out[file_id] = {
+            "peer_id": peer_id,
+            "name": path.name,
+            "chunks": chunks,
+        }
+        entry = self._me_entry(
+            peer_id,
+            {"type": "text", "text": f"发送文件：{path.name}（{len(data)} 字节），等待对方接受…"},
+            "waiting",
+        )
+        entry["uid"] = file_id
         self.store.append_history(peer_id, entry)
         self._emit_message(peer_id, entry)
+        return None
+
+    def _handle_file_ack(self, sender, body):
+        st = self._file_out.get(body.get("file_id"))
+        if not st or st["peer_id"] != sender:
+            return
+        self._file_out.pop(body["file_id"], None)
+        if body.get("accept"):
+            for i, chunk in enumerate(st["chunks"]):
+                chunk_body = {
+                    "type": "file_chunk",
+                    "file_id": body["file_id"],
+                    "index": i,
+                    "data": base64.b64encode(chunk).decode(),
+                }
+                env = self._encrypted_env(protocol.TYPE_FILE_CHUNK, sender, chunk_body)
+                if env is not None:
+                    self._dispatch(sender, env, conv=sender)
+            self.store.mark_history_sent(sender, body["file_id"])
+            entry = self._me_entry(
+                sender,
+                {"type": "text", "text": f"对方已接受文件：{st['name']}，正在发送"},
+                "sent",
+            )
+            self.store.append_history(sender, entry)
+            self._emit_message(sender, entry)
+        else:
+            entry = self._me_entry(
+                sender,
+                {"type": "text", "text": f"对方拒绝了文件：{st['name']}"},
+                "sent",
+            )
+            self.store.append_history(sender, entry)
+            self._emit_message(sender, entry)
+        if self.on_message_updated:
+            self.on_message_updated(sender)
+
+    def accept_file(self, file_id):
+        req = self._pending_file_req.pop(file_id, None)
+        if not req:
+            return "没有待确认的文件请求"
+        self._file_rcv[file_id] = {
+            "name": req["name"],
+            "size": req["size"],
+            "sha256": req["sha256"],
+            "total": req["total"],
+            "parts": {},
+            "sender": req["sender"],
+            "nick": req["nick"],
+        }
+        ack = {"type": "file_ack", "file_id": file_id, "accept": True}
+        env = self._encrypted_env(protocol.TYPE_FILE_ACK, req["sender"], ack)
+        if env is not None:
+            self._dispatch(req["sender"], env, conv=req["sender"])
+        entry = {
+            "role": "them",
+            "nick": req["nick"],
+            "type": "file",
+            "text": f"正在接收文件：{req['name']}（{req['size']} 字节）",
+            "ts": time.time(),
+            "conv": req["sender"],
+        }
+        self.store.append_history(req["sender"], entry)
+        self._emit_message(req["sender"], entry)
+        return None
+
+    def reject_file(self, file_id):
+        req = self._pending_file_req.pop(file_id, None)
+        if not req:
+            return "没有待确认的文件请求"
+        ack = {"type": "file_ack", "file_id": file_id, "accept": False}
+        env = self._encrypted_env(protocol.TYPE_FILE_ACK, req["sender"], ack)
+        if env is not None:
+            self._dispatch(req["sender"], env, conv=req["sender"])
+        entry = {
+            "role": "them",
+            "nick": req["nick"],
+            "type": "file",
+            "text": f"已拒绝接收文件：{req['name']}",
+            "ts": time.time(),
+            "conv": req["sender"],
+        }
+        self.store.append_history(req["sender"], entry)
+        self._emit_message(req["sender"], entry)
         return None
 
     def _me_entry(self, conv, body, status):
@@ -371,8 +460,10 @@ class Core:
                 status=old_status,
             )
             if old_status not in (STATUS_FRIEND, STATUS_BLOCKED):
-                self.store.set_friend_status(peer_id, STATUS_FRIEND)
-                self._status(f"已与 {info.get('nick', peer_id[:8])} 直连并自动成为好友")
+                nick = info.get("nick") or peer_id[:8]
+                self._status(
+                    f"已与 {nick} 建立直连（向对方发送消息即可自动发送好友申请）"
+                )
             if old_confirmed and fp and fp != old_confirmed:
                 nick = info.get("nick") or peer_id[:8]
                 self._status(
@@ -487,22 +578,21 @@ class Core:
             self.store.append_history(conv, entry)
             self._emit_message(conv, entry)
         elif t == "file_meta":
-            self._file_rcv[body["file_id"]] = {
+            fid = body["file_id"]
+            self._pending_file_req[fid] = {
+                "sender": sender,
+                "nick": nick,
                 "name": body["name"],
                 "size": body["size"],
                 "sha256": body["sha256"],
                 "total": body["chunks"],
-                "parts": {},
-                "sender": sender,
-                "nick": nick,
             }
-            entry = {
-                "role": "them", "nick": nick, "type": "file",
-                "text": f"正在接收文件：{body['name']}（{body['size']} 字节）",
-                "ts": time.time(), "conv": sender,
-            }
-            self.store.append_history(sender, entry)
-            self._emit_message(sender, entry)
+            if self.on_file_request:
+                self.on_file_request(sender, fid, body["name"], body["size"])
+            else:
+                self.accept_file(fid)
+        elif t == "file_ack":
+            self._handle_file_ack(sender, body)
         elif t == "file_chunk":
             st = self._file_rcv.get(body["file_id"])
             if st is None:

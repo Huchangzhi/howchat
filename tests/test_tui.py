@@ -175,3 +175,45 @@ async def test_dialog_cancel_does_not_crash():
                 app.screen.dismiss(None)
             await pilot.pause()
         assert app.core.identity.nick  # 昵称未被清空
+
+
+@pytest.mark.asyncio
+async def test_single_slash_input_does_not_crash():
+    """输入单个 '/' 不应闪退。"""
+    d = tempfile.mkdtemp()
+    core, identity = make_core(d, 40408)
+    app = HowchatApp(core, broadcast=False)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.input.focus()
+        app.input.value = "/"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.is_running
+
+
+@pytest.mark.asyncio
+async def test_file_confirm_dialog():
+    """收到文件请求应弹出确认对话框，接受后开始接收。"""
+    d = tempfile.mkdtemp()
+    core, identity = make_core(d, 40409)
+    app = HowchatApp(core, broadcast=False)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        core._pending_file_req["fid123"] = {
+            "sender": "peer999",
+            "nick": "测试",
+            "name": "报告.pdf",
+            "size": 1024,
+            "sha256": "x",
+            "total": 1,
+        }
+        app._notify_file_request("peer999", "fid123", "报告.pdf", 1024)
+        await pilot.pause()
+        from howchat.tui.app import FileConfirmDialog
+
+        assert isinstance(app.screen, FileConfirmDialog)
+        # 接受后进入接收状态
+        app.screen.query_one("#accept").press()
+        await pilot.pause()
+        assert "fid123" in core._file_rcv, "接受后应开始接收文件"

@@ -43,14 +43,15 @@ async def run_core_test():
             break
         await asyncio.sleep(0.05)
     assert idb.peer_id in ca.transport.neighbors(), "未建立连接"
-    for _ in range(100):
-        if ca.is_friend(idb.peer_id) and cb.is_friend(ida.peer_id):
-            break
-        await asyncio.sleep(0.05)
-    assert ca.is_friend(idb.peer_id), "直连后应自动成为好友"
+    assert not ca.is_friend(idb.peer_id), "直连不应自动成为好友"
 
     err = ca.send_text(idb.peer_id, "你好，这是加密消息")
     assert err is None, err
+    for _ in range(200):
+        if ca.is_friend(idb.peer_id) and cb.is_friend(ida.peer_id):
+            break
+        await asyncio.sleep(0.05)
+    assert ca.is_friend(idb.peer_id), "发消息应自动完成好友申请"
     for _ in range(100):
         if got.get("b"):
             break
@@ -63,8 +64,23 @@ async def run_core_test():
     src = tempfile.mktemp()
     with open(src, "wb") as f:
         f.write(os.urandom(200 * 1024))
+    file_requests = []
+
+    def on_file_req(sender, fid, name, size):
+        file_requests.append((sender, fid, name, size))
+
+    cb.on_file_request = on_file_req
     err = ca.send_file(idb.peer_id, src)
     assert err is None, err
+    for _ in range(200):
+        if file_requests:
+            break
+        await asyncio.sleep(0.05)
+    assert file_requests, "B 应收到文件请求（需要同意后才能接收）"
+    assert cb._pending_file_req, "未同意前文件应处于待确认状态"
+    assert not cb._file_rcv, "未同意前不应开始接收数据块"
+    # B 同意接收后才开始传输
+    cb.accept_file(file_requests[0][1])
     for _ in range(300):
         if "已接收文件" in " ".join(e["text"] for _, e in got.get("b", [])):
             break
@@ -116,6 +132,16 @@ async def run_relay_test():
             break
         await asyncio.sleep(0.05)
     assert idr.peer_id in ca.transport.neighbors() and idr.peer_id in cb.transport.neighbors()
+
+    # 直连不自动成为好友：先与中继建立好友关系，中继才会介绍对方
+    assert not ca.is_friend(idr.peer_id), "直连中继不应自动成为好友"
+    assert ca.request_friend(idr.peer_id) is None
+    assert cb.request_friend(idr.peer_id) is None
+    for _ in range(200):
+        if ca.is_friend(idr.peer_id) and cb.is_friend(idr.peer_id):
+            break
+        await asyncio.sleep(0.05)
+    assert ca.is_friend(idr.peer_id) and cb.is_friend(idr.peer_id), "与中继的好友申请应被接受"
 
     for _ in range(200):
         if ca.store.get_contact(idb.peer_id):
@@ -188,11 +214,15 @@ async def run_group_test():
         await asyncio.sleep(0.05)
     for n in nodes[1:]:
         assert hub[1].transport.neighbors(), "节点未连接到中心节点"
+    assert not all(hub[1].is_friend(n[0].peer_id) for n in nodes[1:]), "直连不应自动成为好友"
+    # 显式建立好友关系（好友申请，对方自动接受）
+    for n in nodes[1:]:
+        hub[1].request_friend(n[0].peer_id)
     for _ in range(200):
         if all(hub[1].is_friend(n[0].peer_id) for n in nodes[1:]):
             break
         await asyncio.sleep(0.05)
-    assert all(hub[1].is_friend(n[0].peer_id) for n in nodes[1:]), "直连后未自动成为好友"
+    assert all(hub[1].is_friend(n[0].peer_id) for n in nodes[1:]), "好友申请应被自动接受"
 
     sender = nodes[0]
     others = [n[0].peer_id for n in nodes[1:]]
@@ -387,10 +417,15 @@ async def run_pending_auto_flush_test():
     assert store_a.get_contact(idb.peer_id).status == "pending"
 
     ra.online = True
-    # 对方直连上线：应立即刷新好友请求 + 待达消息
+    # 对方直连上线：flush 队列中的好友申请
     ca._on_peer_change(idb.peer_id, True, {"nick": "乙", "x_pub": x_pub, "ed_pub": ed_pub})
-    assert ca.is_friend(idb.peer_id), "直连后应成为好友"
-    assert ra.sent >= 2, f"应发送好友请求+待达消息，实际发送 {ra.sent}"
+    assert ra.sent >= 1, "直连后应至少发出好友申请"
+    assert not ca.is_friend(idb.peer_id), "直连不应自动成为好友"
+    assert idb.peer_id in ca._pending_auto, "好友关系建立前消息仍应待达"
+    # 对方接受好友申请：立即刷新待达消息
+    ca._handle_friend_accept(idb.peer_id)
+    assert ca.is_friend(idb.peer_id), "接受好友申请后应成为好友"
+    assert ra.sent >= 2, f"应发送好友申请+待达消息，实际发送 {ra.sent}"
     assert not ca._pending_auto, "待达消息应在成为好友后清空"
 
     await ca.stop()
@@ -456,3 +491,70 @@ def test_safe_channel_validation():
     assert not is_safe_channel("../etc")
     assert not is_safe_channel("#..")
     assert not is_safe_channel("#" + "x" * 65)
+
+
+async def run_file_reject_test():
+    import base64
+
+    d1 = tempfile.mkdtemp()
+    d2 = tempfile.mkdtemp()
+    ida = identity_mod.load_or_create(os.path.join(d1, "data"))
+    idb = identity_mod.load_or_create(os.path.join(d2, "data"))
+    ra, rb = Router(ida.peer_id), Router(idb.peer_id)
+    ta = LANTransport(ida, ra, host="127.0.0.1", tcp_port=40971)
+    tb = LANTransport(idb, rb, host="127.0.0.1", tcp_port=40972)
+    store_a = Store(os.path.join(d1, "store"))
+    store_b = Store(os.path.join(d2, "store"))
+    ca = Core(ida, store_a, ra, ta)
+    cb = Core(idb, store_b, rb, tb)
+    got_a = []
+
+    def on_a(conv, entry):
+        got_a.append((conv, entry))
+
+    ca.on_message = on_a
+    await ca.start(broadcast=False)
+    await cb.start(broadcast=False)
+    await ca.connect_host("127.0.0.1", 40972)
+    for _ in range(200):
+        if idb.peer_id in ca.transport.neighbors():
+            break
+        await asyncio.sleep(0.02)
+    # 建立好友关系
+    ca.send_text(idb.peer_id, "hi")
+    for _ in range(200):
+        if ca.is_friend(idb.peer_id) and cb.is_friend(ida.peer_id):
+            break
+        await asyncio.sleep(0.02)
+    assert ca.is_friend(idb.peer_id)
+
+    requests = []
+    cb.on_file_request = lambda s, fid, name, size: requests.append(fid)
+    src = tempfile.mktemp()
+    with open(src, "wb") as f:
+        f.write(b"hello reject")
+
+    err = ca.send_file(idb.peer_id, src)
+    assert err is None, err
+    for _ in range(200):
+        if requests:
+            break
+        await asyncio.sleep(0.02)
+    assert requests, "B 应收到文件请求"
+    cb.reject_file(requests[0])
+    # 被拒绝后不应落盘、不应继续传输
+    await asyncio.sleep(0.2)
+    assert not list(cb.store.files_path().glob("*")), "被拒绝的文件不应落盘"
+    # A 侧历史应显示拒绝
+    for _ in range(200):
+        if any("拒绝" in e.get("text", "") for _c, e in got_a):
+            break
+        await asyncio.sleep(0.02)
+    assert any("拒绝" in e.get("text", "") for _c, e in got_a), "A 应看到对方拒绝提示"
+
+    await ca.stop()
+    await cb.stop()
+
+
+def test_core_file_reject():
+    asyncio.run(run_file_reject_test())
