@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -10,6 +11,13 @@ STATUS_STRANGER = "stranger"
 STATUS_PENDING = "pending"
 STATUS_FRIEND = "friend"
 STATUS_BLOCKED = "blocked"
+
+CHANNEL_RE = re.compile(r"^#[A-Za-z0-9_\-\u4e00-\u9fa5]{1,64}$")
+
+
+def is_safe_channel(name):
+    """频道名必须为 # 开头的安全字符，防止路径穿越等攻击。"""
+    return bool(name) and bool(CHANNEL_RE.match(name))
 
 
 @dataclass

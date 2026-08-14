@@ -65,6 +65,10 @@ class BluetoothTransport(Transport):
         for conn in list(self._connections.values()):
             conn.queue.put_nowait(None)
             try:
+                conn.sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
                 conn.sock.close()
             except Exception:
                 pass
@@ -106,13 +110,15 @@ class BluetoothTransport(Transport):
         for mac, port, name in found:
             if self._stop:
                 break
-            pid = await asyncio.to_thread(_bt_probe_identity, self.identity, mac, port)
-            if not pid:
+            result = await asyncio.to_thread(_bt_probe_identity, self.identity, mac, port)
+            if not result:
                 continue
+            pid, sock, info = result
+            if pid in self._connections:
+                self._close_sock(sock)
+            else:
+                self._register(pid, sock, info)
             verified.append((mac, port, name, pid))
-            if pid not in self._connections:
-                loop = asyncio.get_running_loop()
-                loop.create_task(self._autoconnect(mac, port))
         return verified
 
     async def _accept_loop(self):
@@ -178,18 +184,18 @@ class BluetoothTransport(Transport):
             self._close_sock(sock)
             return
         peer_id = env["src"]
-        if peer_id == self.identity.peer_id:
-            self._close_sock(sock)
-            return
-        if peer_id in self._connections:
-            self._close_sock(sock)
-            return
         body = env.get("body", {})
         info = {
             "nick": body.get("nick", peer_id),
             "x_pub": body.get("x_pub", ""),
             "ed_pub": body.get("ed_pub", ""),
         }
+        self._register(peer_id, sock, info)
+
+    def _register(self, peer_id, sock, info):
+        if peer_id == self.identity.peer_id or peer_id in self._connections:
+            self._close_sock(sock)
+            return
         conn = _BtConn(peer_id, sock)
         self._connections[peer_id] = conn
         self.router.add_neighbor(peer_id, 1)
@@ -341,10 +347,11 @@ def _bt_discover(uuid, duration=4):
                 if svc_name and "howchat" not in svc_name.lower():
                     continue
                 ports.add(port)
-        for port in ports:
-            if addr in seen:
+        for port in sorted(ports):
+            key = (addr, port)
+            if key in seen:
                 continue
-            seen.add(addr)
+            seen.add(key)
             candidates.append((addr, port, name or mac))
     return candidates
 
@@ -369,13 +376,19 @@ def _bt_probe_identity(identity, mac, port, timeout=HANDSHAKE_TIMEOUT):
         if env.get("type") != protocol.TYPE_HELLO:
             return None
         pid = env.get("src")
-        if pid and pid != identity.peer_id:
-            return pid
-        return None
+        if not pid or pid == identity.peer_id:
+            return None
+        body = env.get("body", {})
+        info = {
+            "nick": body.get("nick", pid),
+            "x_pub": body.get("x_pub", ""),
+            "ed_pub": body.get("ed_pub", ""),
+        }
+        sock.settimeout(None)
+        return pid, sock, info
     except Exception:
-        return None
-    finally:
         try:
             sock.close()
         except Exception:
             pass
+        return None

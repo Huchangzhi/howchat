@@ -30,7 +30,7 @@ def main():
 
     data_dir = Path(args.data_dir).expanduser()
     identity = identity_mod.load_or_create(data_dir)
-    store = Store(data_dir / "store")
+    store = Store(data_dir)
     router = Router(identity.peer_id)
     transport = LANTransport(identity, router, host=args.host, tcp_port=args.port)
     extra = []

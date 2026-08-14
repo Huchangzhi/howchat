@@ -7,7 +7,7 @@ import uuid
 from pathlib import Path
 
 from howchat import crypto, protocol
-from howchat.store import STATUS_BLOCKED, STATUS_FRIEND, STATUS_PENDING, STATUS_STRANGER, Contact
+from howchat.store import STATUS_BLOCKED, STATUS_FRIEND, STATUS_PENDING, STATUS_STRANGER, Contact, is_safe_channel
 
 FILE_CHUNK = 64 * 1024
 FLUSH_INTERVAL = 5.0
@@ -33,6 +33,7 @@ class Core:
         for t in self.transports:
             t.on_peer_change = self._on_peer_change
         self._flush_task = None
+        self.data_dir = None
 
     async def start(self, broadcast=True):
         for t in self.transports:
@@ -260,14 +261,39 @@ class Core:
         return None
 
     def send_group(self, channel, text):
-        members = self.store.channel_members(channel)
+        if not text:
+            return "消息不能为空"
+        if not is_safe_channel(channel):
+            return "频道名不合法"
+        members = set(self.store.channel_members(channel))
+        members.add(self.identity.peer_id)
+        if members != set(self.store.channel_members(channel)):
+            self.store.add_channel_member(channel, sorted(members))
         friends = [m for m in members if self.is_friend(m)]
         if not friends:
             return f"频道 {channel} 没有可发送的好友成员"
+        body = {
+            "type": "text",
+            "text": text,
+            "group": channel,
+            "members": sorted(members),
+        }
+        queued = False
+        first_uid = None
         for m in friends:
-            err = self.send_text(m, text, group=channel)
-            if err:
-                return err
+            env = self._encrypted_env(protocol.TYPE_MSG, m, body)
+            if env is None:
+                continue
+            status, uid = self._dispatch(m, env, conv=channel)
+            if status == "queued":
+                queued = True
+                if first_uid is None:
+                    first_uid = uid
+        entry = self._me_entry(channel, body, "queued" if queued else "sent")
+        if first_uid:
+            entry["uid"] = first_uid
+        self.store.append_history(channel, entry)
+        self._emit_message(channel, entry)
         return None
 
     def send_file(self, peer_id, path):
@@ -355,6 +381,7 @@ class Core:
                 )
             self.flush_queued()
             if self.is_friend(peer_id):
+                self._flush_pending_auto(peer_id)
                 self._send_peer_list(peer_id)
                 for n in self._friends():
                     if n != peer_id:
@@ -445,9 +472,10 @@ class Core:
                 self._status(f"通过好友 {nick} 获取了 {got} 位联系人的公钥")
             return
         if t == "text":
-            conv = body.get("group") or sender
-            if body.get("group"):
-                self._ensure_channel(body["group"], sender)
+            conv = sender
+            if body.get("group") and is_safe_channel(body["group"]):
+                self._ensure_channel(body["group"], sender, body.get("members", []))
+                conv = body["group"]
             entry = {
                 "role": "them",
                 "nick": nick,
@@ -480,20 +508,21 @@ class Core:
             if st is None:
                 return
             st["parts"][body["index"]] = base64.b64decode(body["data"])
-            if len(st["parts"]) >= st["total"]:
+            if len(st["parts"]) >= st["total"] and all(
+                i in st["parts"] for i in range(st["total"])
+            ):
                 self._assemble_file(st)
 
-    def _ensure_channel(self, channel, sender):
-        members = self.store.channel_members(channel)
-        changed = False
-        if self.identity.peer_id not in members:
-            members.add(self.identity.peer_id)
-            changed = True
-        if sender not in members:
-            members.add(sender)
-            changed = True
-        if changed:
-            self.store.add_channel_member(channel, list(members))
+    def _ensure_channel(self, channel, sender, members=()):
+        if not is_safe_channel(channel):
+            return
+        known = self.store.channel_members(channel)
+        merged = set(known)
+        merged.add(self.identity.peer_id)
+        merged.add(sender)
+        merged.update(members)
+        merged.discard("")
+        self.store.add_channel_member(channel, sorted(merged))
 
     def _assemble_file(self, st):
         data = b"".join(st["parts"][i] for i in range(st["total"]))

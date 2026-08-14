@@ -2,6 +2,8 @@ import asyncio
 import os
 import tempfile
 
+from pathlib import Path
+
 from howchat import identity as identity_mod
 from howchat.core import Core
 from howchat.routing import Router
@@ -205,6 +207,17 @@ async def run_group_test():
         assert got[ident.peer_id], f"{ident.nick} 未收到群聊消息"
         assert got[ident.peer_id][0][1]["text"] == "大家好，群聊消息"
 
+    # 群聊发送方历史应只有一条记录（不能每个成员各写一条）
+    hist = sender[1].store.history("#office")
+    me_texts = [e.get("text") for e in hist if e.get("role") == "me"]
+    assert me_texts.count("大家好，群聊消息") == 1, f"群聊历史出现重复：{me_texts}"
+
+    # 成员名单应随消息传播：所有节点（含未直连者）都应知道完整成员
+    ids = {n[0].peer_id for n in nodes}
+    for ident, core in nodes:
+        members = core.store.channel_members("#office")
+        assert ids <= members, f"{ident.peer_id} 的群成员缺失：{members}"
+
     for ident, core in nodes:
         await core.stop()
 
@@ -334,3 +347,112 @@ async def run_friend_verify_test():
 
 def test_core_friend_verify_and_keychange():
     asyncio.run(run_friend_verify_test())
+
+
+async def run_pending_auto_flush_test():
+    d1 = tempfile.mkdtemp()
+    d2 = tempfile.mkdtemp()
+    ida = identity_mod.load_or_create(os.path.join(d1, "data"))
+    idb = identity_mod.load_or_create(os.path.join(d2, "data"))
+
+    class CountingRouter(Router):
+        def __init__(self, peer_id):
+            super().__init__(peer_id)
+            self.online = False
+            self.sent = 0
+
+        def send(self, env):
+            if self.online:
+                self.sent += 1
+                return True
+            return False
+
+    ra = CountingRouter(ida.peer_id)
+    ta = LANTransport(ida, ra, host="127.0.0.1", tcp_port=40901)
+    store_a = Store(os.path.join(d1, "store"))
+    ca = Core(ida, store_a, ra, ta)
+    await ca.start(broadcast=False)
+
+    import base64
+
+    x_pub = base64.b64encode(ida.x_pub_bytes()).decode()
+    ed_pub = base64.b64encode(ida.ed_pub_bytes()).decode()
+    # B 以陌生联系人身份出现（经中继介绍），有关键但未连接
+    store_a.update_contact_keys(idb.peer_id, "乙", x_pub, ed_pub, ca._fingerprint(x_pub))
+
+    ra.online = False
+    err = ca.send_text(idb.peer_id, "离线待达消息")
+    assert err is None, err
+    assert idb.peer_id in ca._pending_auto, "陌生人的消息应进入待达队列"
+    assert store_a.get_contact(idb.peer_id).status == "pending"
+
+    ra.online = True
+    # 对方直连上线：应立即刷新好友请求 + 待达消息
+    ca._on_peer_change(idb.peer_id, True, {"nick": "乙", "x_pub": x_pub, "ed_pub": ed_pub})
+    assert ca.is_friend(idb.peer_id), "直连后应成为好友"
+    assert ra.sent >= 2, f"应发送好友请求+待达消息，实际发送 {ra.sent}"
+    assert not ca._pending_auto, "待达消息应在成为好友后清空"
+
+    await ca.stop()
+
+
+def test_core_pending_auto_flushed_on_direct_connect():
+    asyncio.run(run_pending_auto_flush_test())
+
+
+async def run_malicious_channel_test():
+    import base64
+
+    d1 = tempfile.mkdtemp()
+    d2 = tempfile.mkdtemp()
+    ida = identity_mod.load_or_create(os.path.join(d1, "data"))
+    idb = identity_mod.load_or_create(os.path.join(d2, "data"))
+    ra, rb = Router(ida.peer_id), Router(idb.peer_id)
+    ta = LANTransport(ida, ra, host="127.0.0.1", tcp_port=40951)
+    tb = LANTransport(idb, rb, host="127.0.0.1", tcp_port=40952)
+    store_a = Store(os.path.join(d1, "store"))
+    store_b = Store(os.path.join(d2, "store"))
+    ca = Core(ida, store_a, ra, ta)
+    cb = Core(idb, store_b, rb, tb)
+    await ca.start(broadcast=False)
+    await cb.start(broadcast=False)
+
+    x_pub = base64.b64encode(ida.x_pub_bytes()).decode()
+    ed_pub = base64.b64encode(ida.ed_pub_bytes()).decode()
+    store_b.update_contact_keys(ida.peer_id, "甲", x_pub, ed_pub)
+    store_b.set_friend_status(ida.peer_id, "friend")
+
+    # 恶意频道名（路径穿越）不得写入任意路径，应退化为私聊
+    evil = "../../evil"
+    (Path(d2).parent / "evil.json").unlink(missing_ok=True)
+    cb._handle_body(ida.peer_id, {"type": "text", "text": "x", "group": evil})
+    assert evil not in store_b.channels(), "恶意频道名不应写入频道表"
+    assert not (Path(d2).parent / "evil.json").exists(), "路径穿越历史文件不应被创建"
+    assert not (Path(d2) / "evil.json").exists()
+    hist = store_b.history(ida.peer_id)
+    assert hist and hist[-1]["text"] == "x", "不合法频道名的消息应落到私聊历史"
+
+    # 非法频道名 /join 应被拒绝
+    err = ca.send_group(evil, "hi")
+    assert err == "频道名不合法", err
+
+    await ca.stop()
+    await cb.stop()
+
+
+def test_core_malicious_channel_name_sanitized():
+    asyncio.run(run_malicious_channel_test())
+
+
+def test_safe_channel_validation():
+    from howchat.store import is_safe_channel
+
+    assert is_safe_channel("#abc")
+    assert is_safe_channel("#办公室")
+    assert is_safe_channel("#a-b_c1")
+    assert not is_safe_channel("abc")
+    assert not is_safe_channel("")
+    assert not is_safe_channel("#a/b")
+    assert not is_safe_channel("../etc")
+    assert not is_safe_channel("#..")
+    assert not is_safe_channel("#" + "x" * 65)
